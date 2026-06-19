@@ -40,11 +40,14 @@ import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
 import {
+  buildSubtitleAnalysisChunks,
+  buildSubtitleAnalysisConsolidationPrompt,
   buildSubtitleAnalysisPrompt,
   buildSubtitleGenerationPrompt,
   buildSubtitleGenerationUserPrompt,
   buildSubtitleSourceContext,
   isSubtitleSourcePath,
+  mergeSubtitleAnalyses,
   parseSubtitleAnalysisResponse,
 } from "@/lib/subtitle-ingest"
 
@@ -812,42 +815,121 @@ async function autoIngestImpl(
       detail: "Step 1/2: Extracting subtitle knowledge points...",
     })
     analysis = ""
-    const subtitleAnalysisPrompt = buildSubtitleAnalysisPrompt({
-      purpose,
-      index,
-      sourceIdentity,
-      folderContext,
+    const analysisChunks = buildSubtitleAnalysisChunks({
       sourceContent: enrichedSourceContent,
-      maxSourceChars: sourceBudget,
+      sourceIdentity,
+      maxChars: sourceBudget,
     })
+    const chunkAnalyses: string[] = []
 
-    await streamChat(
-      llmConfig,
-      [
-        { role: "system", content: subtitleAnalysisPrompt.system },
-        { role: "user", content: subtitleAnalysisPrompt.user },
-      ],
-      {
-        onToken: (token) => { analysis += token },
-        onDone: () => {},
-        onError: (err) => {
-          activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
+    for (const chunk of analysisChunks) {
+      let chunkAnalysis = ""
+      activity.updateItem(activityId, {
+        detail: analysisChunks.length > 1
+          ? `Step 1/2: Extracting subtitle knowledge points... ${chunk.index}/${chunk.total}`
+          : "Step 1/2: Extracting subtitle knowledge points...",
+      })
+      const subtitleAnalysisPrompt = buildSubtitleAnalysisPrompt({
+        purpose,
+        index,
+        sourceIdentity,
+        folderContext,
+        sourceContent: chunk.content,
+        maxSourceChars: sourceBudget,
+      })
+      const chunkScope = analysisChunks.length > 1
+        ? [
+            "",
+            `Subtitle chunk: ${chunk.index}/${chunk.total}`,
+            chunk.startTime && chunk.endTime ? `Chunk time range: ${chunk.startTime}-${chunk.endTime}` : "",
+            `Subtitle entries in this chunk: ${chunk.lineCount}`,
+            "Analyze only this chunk. Keep absolute timestamps so the chunk analyses can be consolidated later.",
+          ].filter(Boolean).join("\n")
+        : ""
+
+      await streamChat(
+        llmConfig,
+        [
+          { role: "system", content: subtitleAnalysisPrompt.system },
+          { role: "user", content: `${subtitleAnalysisPrompt.user}${chunkScope}` },
+        ],
+        {
+          onToken: (token) => { chunkAnalysis += token },
+          onDone: () => {},
+          onError: (err) => {
+            activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
+          },
         },
-      },
-      signal,
-      {
-        temperature: 0.1,
-        reasoning: { mode: "off" },
-        max_tokens: Math.min(12_288, computeIngestGenerationMaxTokens(llmConfig.maxContextSize)),
-      },
-    )
+        signal,
+        {
+          temperature: 0.1,
+          reasoning: { mode: "off" },
+          max_tokens: Math.min(12_288, computeIngestGenerationMaxTokens(llmConfig.maxContextSize)),
+        },
+      )
 
-    const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
-    if (analysisActivity?.status === "error") {
-      throw new Error(analysisActivity.detail || "Analysis stream failed")
+      const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
+      if (analysisActivity?.status === "error") {
+        throw new Error(analysisActivity.detail || "Analysis stream failed")
+      }
+      chunkAnalyses.push(chunkAnalysis)
     }
 
-    const subtitleAnalysis = parseSubtitleAnalysisResponse(analysis)
+    if (chunkAnalyses.length === 1) {
+      analysis = chunkAnalyses[0]
+    } else {
+      activity.updateItem(activityId, {
+        detail: `Step 1/2: Consolidating subtitle knowledge points... ${chunkAnalyses.length} chunks`,
+      })
+      let consolidatedAnalysis = ""
+      let consolidationHadError = false
+      const consolidationPrompt = buildSubtitleAnalysisConsolidationPrompt({
+        purpose,
+        index,
+        sourceIdentity,
+        folderContext,
+      })
+      const chunkAnalysisText = chunkAnalyses.map((text, idx) => [
+        `## Chunk ${idx + 1}/${chunkAnalyses.length}`,
+        text,
+      ].join("\n")).join("\n\n")
+      try {
+        await streamChat(
+          llmConfig,
+          [
+            { role: "system", content: consolidationPrompt.system },
+            { role: "user", content: `${consolidationPrompt.userPrefix}\n\n${trimLongText(chunkAnalysisText, sourceBudget)}` },
+          ],
+          {
+            onToken: (token) => { consolidatedAnalysis += token },
+            onDone: () => {},
+            onError: (err) => {
+              consolidationHadError = true
+              console.warn(`[ingest:subtitle] consolidation failed for "${sourceIdentity}": ${err.message}`)
+            },
+          },
+          signal,
+          {
+            temperature: 0.1,
+            reasoning: { mode: "off" },
+            max_tokens: Math.min(12_288, computeIngestGenerationMaxTokens(llmConfig.maxContextSize)),
+          },
+        )
+      } catch (err) {
+        if (signal?.aborted) throw err
+        consolidationHadError = true
+        console.warn(`[ingest:subtitle] consolidation failed for "${sourceIdentity}":`, err)
+      }
+      analysis = !consolidationHadError && consolidatedAnalysis.trim()
+        ? consolidatedAnalysis
+        : JSON.stringify(mergeSubtitleAnalyses(chunkAnalyses.map(parseSubtitleAnalysisResponse)), null, 2)
+    }
+
+    let subtitleAnalysis = parseSubtitleAnalysisResponse(analysis)
+    if (subtitleAnalysis.knowledge_points.length === 0 && chunkAnalyses.length > 1) {
+      subtitleAnalysis = mergeSubtitleAnalyses(chunkAnalyses.map(parseSubtitleAnalysisResponse))
+      analysis = JSON.stringify(subtitleAnalysis, null, 2)
+    }
     if (subtitleAnalysis.knowledge_points.length === 0) {
       console.warn(`[ingest:subtitle] no knowledge_points parsed for "${sourceIdentity}"; generation will fall back to available transcript context`)
     }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  buildSubtitleAnalysisChunks,
   buildSubtitleSourceContext,
   createTimestampLink,
   parseSubtitleAnalysisResponse,
@@ -62,6 +63,25 @@ describe("subtitle ingest helpers", () => {
     expect(parsed.knowledge_points[0].concept_name).toBe("要约")
   })
 
+  it("builds analysis chunks on subtitle entry boundaries", () => {
+    const content = Array.from({ length: 5 }, (_, idx) => [
+      String(idx + 1),
+      `00:00:0${idx},000 --> 00:00:0${idx + 1},000`,
+      `第${idx + 1}条字幕内容用于测试分块。`,
+    ].join("\n")).join("\n\n")
+
+    const chunks = buildSubtitleAnalysisChunks({
+      sourceIdentity: "lecture.srt",
+      sourceContent: content,
+      maxChars: 70,
+    })
+
+    expect(chunks.length).toBeGreaterThan(1)
+    expect(chunks.flatMap((chunk) => chunk.content.split("\n")).filter(Boolean)).toHaveLength(5)
+    expect(chunks[0].content).toMatch(/^\[00:00-00:01\] 第1条字幕内容/)
+    expect(chunks[0].startTime).toBe("00:00")
+  })
+
   it("segments subtitle content by knowledge point time ranges", () => {
     const content = [
       "1",
@@ -96,6 +116,41 @@ describe("subtitle ingest helpers", () => {
     expect(segments[0].suggestedPath).toBe("wiki/concepts/要约.md")
     expect(segments[0].content).toContain("要约是希望和他人订立合同")
     expect(segments[0].content).not.toContain("承诺到达")
+  })
+
+  it("trims matched subtitle segments without cutting through subtitle entries", () => {
+    const content = [
+      "1",
+      "00:00:01,000 --> 00:00:02,000",
+      "第一条完整字幕。",
+      "",
+      "2",
+      "00:00:03,000 --> 00:00:04,000",
+      "第二条完整字幕。",
+      "",
+      "3",
+      "00:00:05,000 --> 00:00:06,000",
+      "第三条完整字幕。",
+    ].join("\n")
+
+    const [segment] = segmentSubtitleByKnowledgePoints({
+      sourceIdentity: "lecture.srt",
+      sourceContent: content,
+      analysis: {
+        knowledge_points: [
+          {
+            concept_name: "测试知识点",
+            time_range: "00:00:01-00:00:06",
+          },
+        ],
+      },
+      bufferSeconds: 0,
+      maxSegmentChars: 42,
+    })
+
+    expect(segment.content).toContain("第一条完整字幕")
+    expect(segment.content).toContain("[...remaining subtitle entries trimmed for prompt budget...]")
+    expect(segment.content).not.toMatch(/第[二三]条完整$/)
   })
 
   it("falls back to a compact transcript when no knowledge points parse", () => {

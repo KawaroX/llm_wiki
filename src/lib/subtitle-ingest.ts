@@ -39,6 +39,15 @@ export interface SubtitleSegment {
   content: string
 }
 
+export interface SubtitleAnalysisChunk {
+  index: number
+  total: number
+  lineCount: number
+  startTime?: string
+  endTime?: string
+  content: string
+}
+
 interface TimeRange {
   start: number
   end: number
@@ -140,6 +149,97 @@ export function parseSubtitleAnalysisResponse(raw: string): SubtitleAnalysis {
   }
 }
 
+export function buildSubtitleAnalysisChunks(args: {
+  sourceContent: string
+  sourceIdentity: string
+  maxChars: number
+}): SubtitleAnalysisChunk[] {
+  const maxChars = Math.max(1, args.maxChars)
+  const lines = parseSubtitleContent(args.sourceContent, args.sourceIdentity)
+  if (lines.length === 0) {
+    return chunkPlainText(args.sourceContent.trim(), maxChars)
+  }
+
+  const chunks: SubtitleLine[][] = []
+  let current: SubtitleLine[] = []
+  let currentLength = 0
+
+  for (const line of lines) {
+    const rendered = formatSubtitleLine(line)
+    const nextLength = currentLength + rendered.length + (current.length > 0 ? 1 : 0)
+    if (current.length > 0 && nextLength > maxChars) {
+      chunks.push(current)
+      current = []
+      currentLength = 0
+    }
+    current.push(line)
+    currentLength += rendered.length + (current.length > 1 ? 1 : 0)
+  }
+  if (current.length > 0) chunks.push(current)
+
+  const total = chunks.length
+  return chunks.map((chunk, idx) => ({
+    index: idx + 1,
+    total,
+    lineCount: chunk.length,
+    startTime: formatTimestamp(chunk[0].start),
+    endTime: formatTimestamp(chunk[chunk.length - 1].end ?? chunk[chunk.length - 1].start),
+    content: formatSubtitleLines(chunk),
+  }))
+}
+
+export function buildSubtitleAnalysisConsolidationPrompt(args: {
+  purpose: string
+  index: string
+  sourceIdentity: string
+  folderContext?: string
+}): { system: string; userPrefix: string } {
+  return {
+    system: [
+      "You are consolidating partial JSON analyses of a Chinese legal-exam subtitle course.",
+      "Do not output chain-of-thought, markdown prose, comments, or code fences. Return valid JSON only.",
+      "",
+      "Merge the chunk analyses into one complete course-level knowledge map.",
+      "Rules:",
+      "- Keep all independent legal knowledge points from every chunk.",
+      "- Deduplicate only when two entries clearly describe the same legal concept and overlapping time range.",
+      "- Preserve absolute timestamp ranges from the original transcript.",
+      "- Renumber final knowledge point ids as KP001, KP002, ... in learning order.",
+      "- Preserve teacher emphasis, examples, common traps, exam strategy, and concept relationships.",
+      "",
+      "Return the same JSON shape used by the chunk analyses:",
+      "{",
+      '  "course_overview": {...},',
+      '  "knowledge_points": [...],',
+      '  "concept_structure": {...},',
+      '  "teaching_insights": {...}',
+      "}",
+      "",
+      args.purpose ? `## Wiki Purpose\n${args.purpose}` : "",
+      args.index ? `## Current Wiki Index\n${args.index}` : "",
+    ].filter(Boolean).join("\n"),
+    userPrefix: [
+      `Consolidate subtitle analyses for: ${args.sourceIdentity}`,
+      args.folderContext ? `Folder context: ${args.folderContext}` : "",
+      "",
+      "The following chunk analyses cover the source in order.",
+    ].filter(Boolean).join("\n"),
+  }
+}
+
+export function mergeSubtitleAnalyses(analyses: SubtitleAnalysis[]): SubtitleAnalysis {
+  const knowledgePoints = analyses.flatMap((analysis) => analysis.knowledge_points)
+  return {
+    course_overview: firstPresent(analyses.map((analysis) => analysis.course_overview)),
+    knowledge_points: knowledgePoints.map((kp, idx) => ({
+      ...kp,
+      id: `KP${String(idx + 1).padStart(3, "0")}`,
+    })),
+    concept_structure: firstPresent(analyses.map((analysis) => analysis.concept_structure)),
+    teaching_insights: firstPresent(analyses.map((analysis) => analysis.teaching_insights)),
+  }
+}
+
 export function buildSubtitleAnalysisPrompt(args: {
   purpose: string
   index: string
@@ -161,6 +261,7 @@ export function buildSubtitleAnalysisPrompt(args: {
       "",
       "The source is a course transcript, usually from SRT, LRC, or VTT subtitles. Treat timestamps as first-class evidence.",
       "Use the transcript's language for concept names and definitions. If the transcript is Chinese, output Chinese.",
+      "If the input says it is one chunk of a longer transcript, analyze only that chunk, but keep absolute timestamps and concept names suitable for later consolidation.",
       "",
       "Extraction rules:",
       "- Identify every independent legal-exam knowledge point, not only broad chapter headings.",
@@ -331,7 +432,7 @@ export function buildSubtitleSourceContext(args: {
 
   const combined = `${header}\n\n${body || fallbackTranscript}`.trim()
   if (combined.length <= maxChars) return combined
-  return `${combined.slice(0, maxChars).trimEnd()}\n\n[...trimmed subtitle context for prompt budget...]`
+  return trimAtLineBoundary(combined, maxChars)
 }
 
 export function segmentSubtitleByKnowledgePoints(args: {
@@ -354,17 +455,55 @@ export function segmentSubtitleByKnowledgePoints(args: {
       ? selectLinesForRanges(lines, ranges, args.bufferSeconds ?? DEFAULT_SEGMENT_BUFFER_SECONDS)
       : []
     const segmentText = matched.length > 0
-      ? formatSubtitleLines(matched, args.courseUrl)
-      : fullTranscript
+      ? formatSubtitleLinesWithinBudget(matched, args.courseUrl, maxSegmentChars)
+      : lines.length > 0
+        ? formatSubtitleLinesWithinBudget(lines, args.courseUrl, maxSegmentChars)
+        : trimAtLineBoundary(fullTranscript, maxSegmentChars)
     return {
       knowledgePoint: kp,
       suggestedPath: suggestedKnowledgePointPath(kp, idx),
       timeRange: ranges.length > 0
         ? ranges.map((range) => `${formatTimestamp(range.start)}-${formatTimestamp(range.end)}`).join(", ")
         : stringifyTimeRange(kp.time_range) || "unknown",
-      content: trimLongText(segmentText, maxSegmentChars),
+      content: segmentText,
     }
   })
+}
+
+function chunkPlainText(text: string, maxChars: number): SubtitleAnalysisChunk[] {
+  if (!text) return [{ index: 1, total: 1, lineCount: 0, content: "" }]
+  const chunks: string[] = []
+  let current: string[] = []
+  let currentLength = 0
+  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+    const nextLength = currentLength + line.length + (current.length > 0 ? 1 : 0)
+    if (current.length > 0 && nextLength > maxChars) {
+      chunks.push(current.join("\n"))
+      current = []
+      currentLength = 0
+    }
+    if (line.length > maxChars) {
+      if (current.length > 0) {
+        chunks.push(current.join("\n"))
+        current = []
+        currentLength = 0
+      }
+      for (let i = 0; i < line.length; i += maxChars) {
+        chunks.push(line.slice(i, i + maxChars))
+      }
+      continue
+    }
+    current.push(line)
+    currentLength += line.length + (current.length > 1 ? 1 : 0)
+  }
+  if (current.length > 0) chunks.push(current.join("\n"))
+  const total = chunks.length
+  return chunks.map((content, idx) => ({
+    index: idx + 1,
+    total,
+    lineCount: content.split("\n").filter((line) => line.trim()).length,
+    content,
+  }))
 }
 
 function parseSrtContent(content: string): SubtitleLine[] {
@@ -421,18 +560,39 @@ function parseCueTimeLine(line: string): { start: number; end: number; raw: stri
 
 function compactSubtitleForPrompt(content: string, path: string, maxChars: number): string {
   const lines = parseSubtitleContent(content, path)
-  const compact = lines.length > 0 ? formatSubtitleLines(lines) : content.trim()
+  const compact = lines.length > 0
+    ? formatSubtitleLinesWithinBudget(lines, undefined, maxChars)
+    : trimAtLineBoundary(content.trim(), maxChars)
   if (compact.length <= maxChars) return compact
-  return trimEvenly(compact, maxChars)
+  return trimAtLineBoundary(compact, maxChars)
 }
 
 function formatSubtitleLines(lines: SubtitleLine[], courseUrl?: string): string {
-  return lines.map((line) => {
-    const start = formatTimestamp(line.start)
-    const end = typeof line.end === "number" ? `-${formatTimestamp(line.end)}` : ""
-    if (courseUrl) return `${createTimestampLink(start, courseUrl)}${end} ${line.text}`
-    return `[${start}${end}] ${line.text}`
-  }).join("\n")
+  return lines.map((line) => formatSubtitleLine(line, courseUrl)).join("\n")
+}
+
+function formatSubtitleLinesWithinBudget(lines: SubtitleLine[], courseUrl: string | undefined, maxChars: number): string {
+  if (lines.length === 0) return ""
+  const out: string[] = []
+  let length = 0
+  for (const line of lines) {
+    const rendered = formatSubtitleLine(line, courseUrl)
+    const nextLength = length + rendered.length + (out.length > 0 ? 1 : 0)
+    if (out.length > 0 && nextLength > maxChars) {
+      out.push("[...remaining subtitle entries trimmed for prompt budget...]")
+      break
+    }
+    out.push(rendered)
+    length += rendered.length + (out.length > 1 ? 1 : 0)
+  }
+  return out.join("\n")
+}
+
+function formatSubtitleLine(line: SubtitleLine, courseUrl?: string): string {
+  const start = formatTimestamp(line.start)
+  const end = typeof line.end === "number" ? `-${formatTimestamp(line.end)}` : ""
+  if (courseUrl) return `${createTimestampLink(start, courseUrl)}${end} ${line.text}`
+  return `[${start}${end}] ${line.text}`
 }
 
 function parseKnowledgePointRanges(kp: SubtitleKnowledgePoint): TimeRange[] {
@@ -510,13 +670,14 @@ function trimLongText(text: string, maxChars: number): string {
   return `${text.slice(0, maxChars).trimEnd()}\n[...trimmed...]`
 }
 
-function trimEvenly(text: string, maxChars: number): string {
+function trimAtLineBoundary(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
-  const marker = "\n[...middle transcript omitted for prompt budget...]\n"
+  const marker = "\n[...trimmed for prompt budget...]"
   const keep = Math.max(0, maxChars - marker.length)
-  const head = Math.floor(keep * 0.6)
-  const tail = keep - head
-  return `${text.slice(0, head).trimEnd()}${marker}${text.slice(-tail).trimStart()}`
+  const slice = text.slice(0, keep)
+  const boundary = slice.lastIndexOf("\n")
+  const head = boundary > Math.floor(keep * 0.5) ? slice.slice(0, boundary) : slice
+  return `${head.trimEnd()}${marker}`
 }
 
 function extractJsonObject(text: string): string | null {
@@ -537,4 +698,14 @@ function firstString(...values: unknown[]): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function firstPresent(values: unknown[]): unknown {
+  return values.find((value) => {
+    if (value === undefined || value === null) return false
+    if (typeof value === "string") return value.trim().length > 0
+    if (Array.isArray(value)) return value.length > 0
+    if (typeof value === "object") return Object.keys(value).length > 0
+    return true
+  })
 }
