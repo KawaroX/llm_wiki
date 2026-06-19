@@ -39,6 +39,7 @@ import {
   normalizeSourceWatchConfig,
 } from "@/lib/source-watch-config"
 import type { SourceWatchConfig } from "@/stores/wiki-store"
+import { removeSourceMetadata, saveSourceCourseUrls } from "@/lib/source-metadata"
 
 export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
   "md",
@@ -163,9 +164,11 @@ export async function importSourceFiles(
   sourcePaths: string[],
   llmConfig: LlmConfig,
   sourceWatchConfig?: SourceWatchConfig,
+  courseUrls: Record<string, string> = {},
 ): Promise<string[]> {
   const pp = normalizePath(project.path)
   const importedPaths: string[] = []
+  const courseUrlEntries: Array<{ sourcePath: string; courseUrl: string }> = []
   const cfg = normalizeSourceWatchConfig(sourceWatchConfig)
   const maxBytes = cfg.maxFileSizeMb * 1024 * 1024
 
@@ -193,12 +196,18 @@ export async function importSourceFiles(
     try {
       await copyFile(sourcePath, destPath)
       importedPaths.push(destPath)
+      if (courseUrls[sourcePath]) {
+        courseUrlEntries.push({ sourcePath: destPath, courseUrl: courseUrls[sourcePath] })
+      }
       preprocessFile(destPath).catch(() => {})
     } catch (err) {
       console.error(`Failed to import ${originalName}:`, err)
     }
   }
 
+  if (courseUrlEntries.length > 0) {
+    await saveSourceCourseUrls(pp, courseUrlEntries)
+  }
   await enqueueSourceIngest(project, importedPaths, llmConfig)
 
   return importedPaths
@@ -309,6 +318,11 @@ export async function deleteSourceFiles(
         // non-critical
       }
     }
+  }
+  try {
+    await removeSourceMetadata(pp, sourceInfos.map((info) => info.source))
+  } catch {
+    // metadata cleanup is non-critical
   }
 
   const pagesToDelete: string[] = []

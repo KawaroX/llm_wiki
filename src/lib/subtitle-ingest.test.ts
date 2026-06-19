@@ -3,6 +3,8 @@ import {
   buildSubtitleAnalysisChunks,
   buildSubtitleSourceContext,
   createTimestampLink,
+  decorateSubtitleMarkdown,
+  linkifySubtitleTimestamps,
   parseSubtitleAnalysisResponse,
   parseSubtitleContent,
   parseTimeToSeconds,
@@ -176,6 +178,32 @@ describe("subtitle ingest helpers", () => {
     )
     expect(createTimestampLink("00:10", "https://www.bilibili.com/video/BV1xx")).toBe(
       "[00:10](https://www.bilibili.com/video/BV1xx?t=10)",
+    )
+  })
+
+  it("adds fakc course metadata and links generated timestamp ranges", () => {
+    const courseUrl = "https://www.bilibili.com/video/BV1xx"
+    const content = [
+      "---",
+      "type: source",
+      'url: ""',
+      "---",
+      "",
+      "## 时间戳",
+      "",
+      "- 00:01:45-00:02:35 — 犯罪构成体系",
+      "- [00:06:37 - 00:10:55] — 达九罗",
+    ].join("\n")
+
+    const decorated = decorateSubtitleMarkdown(content, courseUrl, { sourcePage: true })
+    expect(decorated).toContain(`url: "${courseUrl}"`)
+    expect(decorated).toContain(`course_url: "${courseUrl}"`)
+    expect(decorated).toContain(`[00:01:45](${courseUrl}?t=105)-[00:02:35](${courseUrl}?t=155)`)
+    expect(decorated).toContain(`[00:06:37](${courseUrl}?t=397) - [00:10:55](${courseUrl}?t=655)`)
+
+    const alreadyLinked = `[00:10](${courseUrl}?t=10) and 00:20`
+    expect(linkifySubtitleTimestamps(alreadyLinked, courseUrl)).toBe(
+      `[00:10](${courseUrl}?t=10) and [00:20](${courseUrl}?t=20)`,
     )
   })
 })

@@ -220,6 +220,16 @@ describe("ingest scenarios (fixture-driven)", () => {
         "要约的内容应当具体确定。",
       ].join("\n"),
     )
+    await writeFileRaw(
+      `${projectPath}/.llm-wiki/source-metadata.json`,
+      JSON.stringify({
+        sources: {
+          "raw/sources/law-lecture.srt": {
+            courseUrl: "https://www.bilibili.com/video/BV1course",
+          },
+        },
+      }),
+    )
 
     useWikiStore.setState({
       project: {
@@ -309,8 +319,15 @@ describe("ingest scenarios (fixture-driven)", () => {
       "wiki/sources/law-lecture.md",
       "wiki/concepts/要约.md",
     ]))
-    expect(await readFileRaw(`${projectPath}/wiki/sources/law-lecture.md`)).toContain("合同法课程")
-    expect(await readFileRaw(`${projectPath}/wiki/concepts/要约.md`)).toContain("要约是希望和他人订立合同")
+    const sourcePage = await readFileRaw(`${projectPath}/wiki/sources/law-lecture.md`)
+    const conceptPage = await readFileRaw(`${projectPath}/wiki/concepts/要约.md`)
+    expect(sourcePage).toContain("合同法课程")
+    expect(sourcePage).toContain('url: "https://www.bilibili.com/video/BV1course"')
+    expect(sourcePage).toContain('course_url: "https://www.bilibili.com/video/BV1course"')
+    expect(conceptPage).toContain("要约是希望和他人订立合同")
+    expect(conceptPage).toContain('course_url: "https://www.bilibili.com/video/BV1course"')
+    expect(conceptPage).toContain("[00:00:01](https://www.bilibili.com/video/BV1course?t=1)")
+    expect(conceptPage).toContain("[00:00:08](https://www.bilibili.com/video/BV1course?t=8)")
 
     const analysisCall = mockStreamChat.mock.calls.find(([, messages]) =>
       typeof messages[0]?.content === "string" &&
@@ -324,6 +341,8 @@ describe("ingest scenarios (fixture-driven)", () => {
     expect(generationCall).toBeTruthy()
     expect(generationCall?.[1][1].content).toContain("Matched subtitle segment")
     expect(generationCall?.[1][1].content).toContain("要约的内容应当具体确定")
+    expect(generationCall?.[1][1].content).toContain("Course URL: https://www.bilibili.com/video/BV1course")
+    expect(generationCall?.[1][1].content).toContain("https://www.bilibili.com/video/BV1course?t=1")
   })
 
   it("drops generated pages whose frontmatter type disagrees with schema routing", async () => {

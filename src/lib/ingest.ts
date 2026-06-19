@@ -46,10 +46,12 @@ import {
   buildSubtitleGenerationPrompt,
   buildSubtitleGenerationUserPrompt,
   buildSubtitleSourceContext,
+  decorateSubtitleMarkdown,
   isSubtitleSourcePath,
   mergeSubtitleAnalyses,
   parseSubtitleAnalysisResponse,
 } from "@/lib/subtitle-ingest"
+import { getSourceCourseUrl } from "@/lib/source-metadata"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -558,6 +560,10 @@ async function autoIngestImpl(
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
+  const courseUrl = isSubtitleSource ? await getSourceCourseUrl(pp, sp) : ""
+  const sourceCacheContent = courseUrl
+    ? `${sourceContent}\n\n[llm-wiki course_url: ${courseUrl}]`
+    : sourceContent
 
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
@@ -569,7 +575,7 @@ async function autoIngestImpl(
   // re-running them costs only the extraction time and converges the
   // source-summary page on the current pipeline's contract regardless
   // of when the file was first ingested.
-  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent)
+  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceCacheContent)
   console.log(`[ingest:diag] cache check for "${sourceIdentity}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     try {
@@ -937,6 +943,7 @@ async function autoIngestImpl(
       sourceIdentity,
       sourceContent: enrichedSourceContent,
       analysis: subtitleAnalysis,
+      courseUrl,
       folderContext,
       maxChars: sourceBudget,
     })
@@ -959,6 +966,7 @@ async function autoIngestImpl(
             analysisRaw: analysis,
             analysis: subtitleAnalysis,
             sourceContent: enrichedSourceContent,
+            courseUrl,
             folderContext,
             maxContextChars: sourceBudget,
           }),
@@ -1126,6 +1134,7 @@ async function autoIngestImpl(
     sourceIdentity,
     sourceSummaryPath,
     signal,
+    courseUrl,
   )
   const writtenPaths = writeResult.writtenPaths
   const writeWarnings = writeResult.warnings
@@ -1244,6 +1253,7 @@ async function autoIngestImpl(
       `sources: ["${sourceIdentity}"]`,
       `tags: []`,
       `related: []`,
+      ...(courseUrl ? [`url: ${JSON.stringify(courseUrl)}`, `course_url: ${JSON.stringify(courseUrl)}`] : []),
       "---",
       "",
       `# Source: ${sourceIdentity}`,
@@ -1297,7 +1307,7 @@ async function autoIngestImpl(
   // — they represent deterministic decisions and caching them is
   // safe.
   if (writtenPaths.length > 0 && hardFailures.length === 0) {
-    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)
+    await saveIngestCache(pp, sourceIdentity, sourceCacheContent, writtenPaths)
     if (longSourceCheckpointPath) {
       await clearLongSourceCheckpoint(longSourceCheckpointPath)
     }
@@ -1700,6 +1710,7 @@ async function writeFileBlocks(
   sourceFileName: string,
   sourceSummaryPath?: string,
   signal?: AbortSignal,
+  subtitleCourseUrl?: string,
 ): Promise<{ writtenPaths: string[]; warnings: string[]; hardFailures: string[] }> {
   const { blocks, warnings: parseWarnings } = parseFileBlocks(text)
   const warnings = [...parseWarnings]
@@ -1740,6 +1751,11 @@ async function writeFileBlocks(
     }
     if (!isLogPath(relativePath) && !isListingPath(relativePath)) {
       content = canonicalizeSourcesField(content, sourceFileName)
+    }
+    if (subtitleCourseUrl && !isLogPath(relativePath) && !isListingPath(relativePath)) {
+      content = decorateSubtitleMarkdown(content, subtitleCourseUrl, {
+        sourcePage: !!sourceSummaryPath && relativePath === sourceSummaryPath,
+      })
     }
     if (sourceSummaryPath && relativePath === sourceSummaryPath) {
       content = sourceSummaryMediaRefsForExternalMarkdown(content)

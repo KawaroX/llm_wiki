@@ -11,6 +11,12 @@ import { useTranslation } from "react-i18next"
 import { normalizePath } from "@/lib/path-utils"
 import { decideDeleteClick } from "@/lib/sources-tree-delete"
 import { rescanProjectFileSync } from "@/lib/project-file-sync"
+import { isSubtitleSourcePath } from "@/lib/subtitle-ingest"
+import { getSourceCourseUrl, saveSourceCourseUrls } from "@/lib/source-metadata"
+import {
+  SubtitleCourseUrlDialog,
+  type SubtitleCourseUrlFile,
+} from "@/components/sources/subtitle-course-url-dialog"
 import {
   deleteSourceFile,
   deleteSourceFolder,
@@ -21,6 +27,12 @@ import {
 
 const SOURCE_TREE_INITIAL_ROWS = 160
 const SOURCE_TREE_LOAD_BATCH = 160
+
+interface PendingSubtitleCourseUrls {
+  mode: "import" | "ingest"
+  allPaths: string[]
+  files: SubtitleCourseUrlFile[]
+}
 
 export function SourcesView() {
   const { t } = useTranslation()
@@ -38,6 +50,7 @@ export function SourcesView() {
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
+  const [pendingSubtitleCourseUrls, setPendingSubtitleCourseUrls] = useState<PendingSubtitleCourseUrls | null>(null)
   /**
    * Path of the source-tree node currently in "click again to
    * confirm delete" state. Lifted up here (rather than living
@@ -140,11 +153,28 @@ export function SourcesView() {
 
     if (!selected || selected.length === 0) return
 
+    const paths = Array.isArray(selected) ? selected : [selected]
+    const subtitlePaths = paths.filter(isSubtitleSourcePath)
+    if (subtitlePaths.length > 0) {
+      setPendingSubtitleCourseUrls({
+        mode: "import",
+        allPaths: paths,
+        files: subtitlePaths.map((path) => ({
+          path,
+          name: normalizePath(path).split("/").pop() ?? path,
+        })),
+      })
+      return
+    }
+    await performFileImport(paths)
+  }
+
+  async function performFileImport(paths: string[], courseUrls: Record<string, string> = {}) {
+    if (!project) return
     setImporting(true)
     setImportError(null)
-    const paths = Array.isArray(selected) ? selected : [selected]
     try {
-      await importSourceFiles(project, paths, llmConfig, sourceWatchConfig)
+      await importSourceFiles(project, paths, llmConfig, sourceWatchConfig, courseUrls)
     } catch (err) {
       console.error("Failed to import source files:", err)
       setImportError(String(err))
@@ -250,6 +280,15 @@ export function SourcesView() {
 
   async function handleIngest(node: FileNode) {
     if (!project || ingestingPath) return
+    if (isSubtitleSourcePath(node.path)) {
+      const initialUrl = await getSourceCourseUrl(project.path, node.path)
+      setPendingSubtitleCourseUrls({
+        mode: "ingest",
+        allPaths: [node.path],
+        files: [{ path: node.path, name: node.name, initialUrl }],
+      })
+      return
+    }
     // Re-ingest goes through the same automated queue path as a fresh
     // import (`handleImport` above). Earlier this used `startIngest`,
     // which opens an interactive chat → user clicks "Save to Wiki" →
@@ -262,6 +301,33 @@ export function SourcesView() {
       await enqueueSourceIngest(project, [node.path], llmConfig)
     } catch (err) {
       console.error("Failed to enqueue ingest:", err)
+    } finally {
+      setIngestingPath(null)
+    }
+  }
+
+  async function handleSubtitleCourseUrlSubmit(courseUrls: Record<string, string>) {
+    const pending = pendingSubtitleCourseUrls
+    if (!pending || !project) return
+    setPendingSubtitleCourseUrls(null)
+
+    if (pending.mode === "import") {
+      await performFileImport(pending.allPaths, courseUrls)
+      return
+    }
+
+    const sourcePath = pending.allPaths[0]
+    setIngestingPath(sourcePath)
+    setImportError(null)
+    try {
+      await saveSourceCourseUrls(project.path, pending.files.map((file) => ({
+        sourcePath: file.path,
+        courseUrl: courseUrls[file.path] ?? "",
+      })))
+      await enqueueSourceIngest(project, [sourcePath], llmConfig)
+    } catch (err) {
+      console.error("Failed to save subtitle course URL or enqueue ingest:", err)
+      setImportError(String(err))
     } finally {
       setIngestingPath(null)
     }
@@ -373,6 +439,14 @@ export function SourcesView() {
         </Tooltip>
       </div>
       </div>
+      <SubtitleCourseUrlDialog
+        open={pendingSubtitleCourseUrls !== null}
+        files={pendingSubtitleCourseUrls?.files ?? []}
+        onOpenChange={(open) => {
+          if (!open) setPendingSubtitleCourseUrls(null)
+        }}
+        onSubmit={handleSubtitleCourseUrlSubmit}
+      />
     </TooltipProvider>
   )
 }

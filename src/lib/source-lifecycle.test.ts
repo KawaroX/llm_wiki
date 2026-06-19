@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   listDirectory: vi.fn(),
   preprocessFile: vi.fn(),
   enqueueBatch: vi.fn(),
+  saveSourceCourseUrls: vi.fn(),
+  removeSourceMetadata: vi.fn(),
 }))
 
 vi.mock("@/commands/fs", async () => {
@@ -29,6 +31,11 @@ vi.mock("@/lib/ingest-queue", () => ({
   enqueueBatch: mocks.enqueueBatch,
 }))
 
+vi.mock("@/lib/source-metadata", () => ({
+  saveSourceCourseUrls: mocks.saveSourceCourseUrls,
+  removeSourceMetadata: mocks.removeSourceMetadata,
+}))
+
 import {
   folderContextForSourcePath,
   importSourceFiles,
@@ -46,6 +53,8 @@ beforeEach(() => {
   mocks.listDirectory.mockResolvedValue([])
   mocks.preprocessFile.mockResolvedValue("")
   mocks.enqueueBatch.mockResolvedValue(["task"])
+  mocks.saveSourceCourseUrls.mockResolvedValue(undefined)
+  mocks.removeSourceMetadata.mockResolvedValue(undefined)
 })
 
 describe("source-lifecycle path helpers", () => {
@@ -174,6 +183,9 @@ describe("source-lifecycle path helpers", () => {
         excludeGlobs: [],
         maxFileSizeMb: 100,
       },
+      {
+        "/external/lecture.srt": "https://www.bilibili.com/video/BV1test",
+      },
     )
 
     expect(copied).toEqual([
@@ -188,5 +200,9 @@ describe("source-lifecycle path helpers", () => {
       { sourcePath: "/project/raw/sources/ready.md", folderContext: "" },
       { sourcePath: "/project/raw/sources/lecture.srt", folderContext: "" },
     ])
+    expect(mocks.saveSourceCourseUrls).toHaveBeenCalledWith("/project", [{
+      sourcePath: "/project/raw/sources/lecture.srt",
+      courseUrl: "https://www.bilibili.com/video/BV1test",
+    }])
   })
 })

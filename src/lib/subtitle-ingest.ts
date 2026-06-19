@@ -124,6 +124,62 @@ export function createTimestampLink(timestamp: string, courseUrl?: string): stri
   }
 }
 
+export function decorateSubtitleMarkdown(
+  content: string,
+  courseUrl: string,
+  options: { sourcePage?: boolean } = {},
+): string {
+  if (!courseUrl) return content
+  const frontmatterMatch = content.match(/^(---\s*\r?\n)([\s\S]*?)(\r?\n---\s*(?:\r?\n|$))/)
+  if (!frontmatterMatch) return linkifySubtitleTimestamps(content, courseUrl)
+
+  let payload = setFrontmatterScalar(frontmatterMatch[2], "course_url", courseUrl)
+  if (options.sourcePage) payload = setFrontmatterScalar(payload, "url", courseUrl)
+  const body = content.slice(frontmatterMatch[0].length)
+  return `${frontmatterMatch[1]}${payload}${frontmatterMatch[3]}${linkifySubtitleTimestamps(body, courseUrl)}`
+}
+
+export function linkifySubtitleTimestamps(content: string, courseUrl: string): string {
+  if (!courseUrl) return content
+  const timestamp = String.raw`\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?`
+  const rangeRe = new RegExp(`\\[(${timestamp})(\\s*(?:-->|-|~|至|到)\\s*)(${timestamp})\\](?!\\()`, "g")
+  const bracketedRe = new RegExp(`\\[(${timestamp})\\](?!\\()`, "g")
+  const bareRe = new RegExp(`(?<![\\w/?=&])(${timestamp})(?![\\w]|\\]\\()`, "g")
+  let inFence = false
+
+  return content.split("\n").map((line) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      return line
+    }
+    if (inFence) return line
+
+    const links: string[] = []
+    const protectLinks = (value: string) => value.replace(/\[[^\]\n]+\]\([^\s)]+\)/g, (link) => {
+      const token = `\u0000LINK${links.length}\u0000`
+      links.push(link)
+      return token
+    })
+    let linked = protectLinks(line)
+    linked = linked.replace(rangeRe, (_match, start: string, separator: string, end: string) =>
+      `${createTimestampLink(start, courseUrl)}${separator}${createTimestampLink(end, courseUrl)}`,
+    )
+    linked = linked.replace(bracketedRe, (_match, value: string) => createTimestampLink(value, courseUrl))
+    linked = protectLinks(linked)
+    linked = linked.replace(bareRe, (_match, value: string) => createTimestampLink(value, courseUrl))
+    return linked.replace(/\u0000LINK(\d+)\u0000/g, (_match, index: string) => links[Number(index)] ?? "")
+  }).join("\n")
+}
+
+function setFrontmatterScalar(payload: string, key: string, value: string): string {
+  const encoded = JSON.stringify(value)
+  const lineRe = new RegExp(`(^|\\n)(${key}\\s*:\\s*)[^\\n\\r]*`, "i")
+  if (lineRe.test(payload)) {
+    return payload.replace(lineRe, (_match, prefix: string, label: string) => `${prefix}${label}${encoded}`)
+  }
+  return `${payload.trimEnd()}\n${key}: ${encoded}`
+}
+
 export function parseSubtitleContent(content: string, path = ""): SubtitleLine[] {
   const format = detectSubtitleFormat(content, path)
   if (format === "srt") return parseSrtContent(content)
@@ -346,6 +402,7 @@ export function buildSubtitleGenerationUserPrompt(args: {
   analysisRaw: string
   analysis: SubtitleAnalysis
   sourceContent: string
+  courseUrl?: string
   folderContext?: string
   maxContextChars?: number
 }): string {
@@ -353,6 +410,7 @@ export function buildSubtitleGenerationUserPrompt(args: {
     sourceIdentity: args.sourceIdentity,
     sourceContent: args.sourceContent,
     analysis: args.analysis,
+    courseUrl: args.courseUrl,
     folderContext: args.folderContext,
     maxChars: args.maxContextChars ?? DEFAULT_CONTEXT_CHARS,
   })
@@ -382,12 +440,13 @@ export function buildSubtitleSourceContext(args: {
   sourceIdentity: string
   sourceContent: string
   analysis: SubtitleAnalysis
+  courseUrl?: string
   folderContext?: string
   maxChars?: number
 }): string {
   const maxChars = args.maxChars ?? DEFAULT_CONTEXT_CHARS
   const lines = parseSubtitleContent(args.sourceContent, args.sourceIdentity)
-  const courseUrl = extractFirstUrl(args.sourceContent)
+  const courseUrl = args.courseUrl || extractFirstUrl(args.sourceContent)
   const segments = segmentSubtitleByKnowledgePoints({
     sourceIdentity: args.sourceIdentity,
     sourceContent: args.sourceContent,
