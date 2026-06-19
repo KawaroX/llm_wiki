@@ -32,10 +32,13 @@ vi.mock("./llm-client", () => ({
 }))
 
 import { autoIngest } from "./ingest"
+import { streamChat } from "./llm-client"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useActivityStore } from "@/stores/activity-store"
 import { useChatStore } from "@/stores/chat-store"
+
+const mockStreamChat = vi.mocked(streamChat)
 
 const FIXTURES_ROOT = path.join(
   process.cwd(),
@@ -54,6 +57,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   pendingResponses = []
+  mockStreamChat.mockClear()
   useReviewStore.setState({ items: [] })
   useActivityStore.setState({ items: [] })
   useChatStore.setState({
@@ -195,6 +199,132 @@ describe("ingest scenarios (fixture-driven)", () => {
       await assertOutcome(scenario, ctx.tmp.path)
     },
   )
+
+  it("runs the subtitle-specific two-stage pipeline and writes SRT-derived pages", async () => {
+    ctx = { tmp: await createTempProject("ingest-subtitle-srt") }
+    const projectPath = ctx.tmp.path
+    const sourcePath = `${projectPath}/raw/sources/law-lecture.srt`
+
+    await writeFileRaw(`${projectPath}/purpose.md`, "# Purpose\n\n法考知识库。\n")
+    await writeFileRaw(`${projectPath}/wiki/index.md`, "# Index\n")
+    await writeFileRaw(`${projectPath}/wiki/overview.md`, "# Overview\n")
+    await writeFileRaw(
+      sourcePath,
+      [
+        "1",
+        "00:00:01,000 --> 00:00:04,000",
+        "要约是希望和他人订立合同的意思表示。",
+        "",
+        "2",
+        "00:00:05,000 --> 00:00:08,000",
+        "要约的内容应当具体确定。",
+      ].join("\n"),
+    )
+
+    useWikiStore.setState({
+      project: {
+        name: "t",
+        path: projectPath,
+        createdAt: 0,
+        purposeText: "",
+        fileTree: [],
+      } as unknown as ReturnType<typeof useWikiStore.getState>["project"],
+    })
+    useWikiStore.getState().setLlmConfig({
+      provider: "openai",
+      apiKey: "test-key",
+      model: "gpt-4",
+      ollamaUrl: "",
+      customEndpoint: "",
+      maxContextSize: 128000,
+    })
+
+    pendingResponses = [
+      JSON.stringify({
+        course_overview: {
+          title: "合同法课程",
+          subject: "民法",
+          main_theme: "要约",
+        },
+        knowledge_points: [
+          {
+            id: "KP001",
+            concept_name: "要约",
+            concept_type: "定义性概念",
+            time_range: "00:00:01-00:00:08",
+            core_definition: "希望和他人订立合同的意思表示。",
+          },
+        ],
+        concept_structure: {},
+        teaching_insights: {},
+      }),
+      [
+        "---FILE: wiki/sources/law-lecture.md---",
+        "---",
+        "type: source",
+        'title: "Source: law-lecture.srt"',
+        "created: 2026-06-19",
+        "updated: 2026-06-19",
+        "tags: [法考, 民法]",
+        "related: [要约]",
+        'sources: ["law-lecture.srt"]',
+        "---",
+        "",
+        "# 合同法课程",
+        "",
+        "本课程讲解要约。",
+        "---END FILE---",
+        "",
+        "---FILE: wiki/concepts/要约.md---",
+        "---",
+        "type: concept",
+        'title: "要约"',
+        "created: 2026-06-19",
+        "updated: 2026-06-19",
+        "tags: [法考, 民法, 合同法]",
+        "related: []",
+        'sources: ["law-lecture.srt"]',
+        "---",
+        "",
+        "# 要约",
+        "",
+        "## 核心定义",
+        "",
+        "要约是希望和他人订立合同的意思表示。",
+        "",
+        "## 时间戳",
+        "",
+        "00:00:01-00:00:08",
+        "---END FILE---",
+      ].join("\n"),
+    ]
+
+    const written = await autoIngest(
+      projectPath,
+      sourcePath,
+      useWikiStore.getState().llmConfig,
+    )
+
+    expect(written).toEqual(expect.arrayContaining([
+      "wiki/sources/law-lecture.md",
+      "wiki/concepts/要约.md",
+    ]))
+    expect(await readFileRaw(`${projectPath}/wiki/sources/law-lecture.md`)).toContain("合同法课程")
+    expect(await readFileRaw(`${projectPath}/wiki/concepts/要约.md`)).toContain("要约是希望和他人订立合同")
+
+    const analysisCall = mockStreamChat.mock.calls.find(([, messages]) =>
+      typeof messages[0]?.content === "string" &&
+      messages[0].content.includes("Chinese legal-exam course analyst"),
+    )
+    const generationCall = mockStreamChat.mock.calls.find(([, messages]) =>
+      typeof messages[0]?.content === "string" &&
+      messages[0].content.includes("Subtitle Course Mode"),
+    )
+    expect(analysisCall).toBeTruthy()
+    expect(generationCall).toBeTruthy()
+    expect(generationCall?.[1][1].content).toContain("Matched subtitle segment")
+    expect(generationCall?.[1][1].content).toContain("要约的内容应当具体确定")
+  })
 
   it("drops generated pages whose frontmatter type disagrees with schema routing", async () => {
     ctx = { tmp: await createTempProject("ingest-schema-routing") }
