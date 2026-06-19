@@ -37,6 +37,7 @@ export function SourcesView() {
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [importError, setImportError] = useState<string | null>(null)
   /**
    * Path of the source-tree node currently in "click again to
    * confirm delete" state. Lifted up here (rather than living
@@ -140,11 +141,17 @@ export function SourcesView() {
     if (!selected || selected.length === 0) return
 
     setImporting(true)
+    setImportError(null)
     const paths = Array.isArray(selected) ? selected : [selected]
     try {
       await importSourceFiles(project, paths, llmConfig, sourceWatchConfig)
-      await loadSources()
+    } catch (err) {
+      console.error("Failed to import source files:", err)
+      setImportError(String(err))
     } finally {
+      // Copying may have succeeded even if enqueueing failed. Always refresh
+      // so the imported source is visible and the user can retry ingestion.
+      await loadSources()
       setImporting(false)
     }
   }
@@ -301,6 +308,14 @@ export function SourcesView() {
             {t("sources.refreshFailed", {
               defaultValue: "Failed to refresh sources: {{error}}",
               error: refreshError,
+            })}
+          </div>
+        )}
+        {importError && (
+          <div className="mx-4 mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {t("sources.importFailed", {
+              defaultValue: "Failed to import source: {{error}}",
+              error: importError,
             })}
           </div>
         )}

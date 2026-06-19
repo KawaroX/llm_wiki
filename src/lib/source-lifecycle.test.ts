@@ -153,10 +153,10 @@ describe("source-lifecycle path helpers", () => {
     expect(mocks.copyFile).not.toHaveBeenCalled()
   })
 
-  it("filters single-file imports using the original source path before copying", async () => {
+  it("imports explicitly selected subtitles with a stale source-watch include list", async () => {
     const copied = await importSourceFiles(
       { id: "p1", name: "Project", path: "/project" },
-      ["/external/drafts/spec.md", "/external/ready.md"],
+      ["/external/drafts/spec.md", "/external/ready.md", "/external/lecture.srt"],
       {
         provider: "openai",
         endpoint: "https://api.example.com/v1",
@@ -176,15 +176,17 @@ describe("source-lifecycle path helpers", () => {
       },
     )
 
-    expect(copied).toEqual(["/project/raw/sources/ready.md"])
-    expect(mocks.copyFile).toHaveBeenCalledTimes(1)
+    expect(copied).toEqual([
+      "/project/raw/sources/ready.md",
+      "/project/raw/sources/lecture.srt",
+    ])
+    expect(mocks.copyFile).toHaveBeenCalledTimes(2)
     expect(mocks.copyFile).toHaveBeenCalledWith("/external/ready.md", "/project/raw/sources/ready.md")
+    expect(mocks.copyFile).toHaveBeenCalledWith("/external/lecture.srt", "/project/raw/sources/lecture.srt")
     expect(mocks.copyFile).not.toHaveBeenCalledWith("/external/drafts/spec.md", expect.anything())
     expect(mocks.enqueueBatch).toHaveBeenCalledWith("p1", [
-      {
-        sourcePath: "/project/raw/sources/ready.md",
-        folderContext: "",
-      },
+      { sourcePath: "/project/raw/sources/ready.md", folderContext: "" },
+      { sourcePath: "/project/raw/sources/lecture.srt", folderContext: "" },
     ])
   })
 })

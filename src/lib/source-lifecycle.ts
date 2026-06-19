@@ -33,7 +33,11 @@ import {
   stripDeletedWikilinks,
 } from "@/lib/wiki-cleanup"
 import { collectAllFilesIncludingDot } from "@/lib/sources-tree-delete"
-import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
+import {
+  getSourceWatchExtension,
+  isPathAllowedBySourceWatch,
+  normalizeSourceWatchConfig,
+} from "@/lib/source-watch-config"
 import type { SourceWatchConfig } from "@/stores/wiki-store"
 
 export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
@@ -167,7 +171,15 @@ export async function importSourceFiles(
 
   for (const sourcePath of sourcePaths) {
     const originalName = getFileName(sourcePath) || "unknown"
-    let allowed = isPathAllowedBySourceWatch(sourcePath, cfg)
+    // A file explicitly selected in the picker must not be rejected by a
+    // stale source-watch include list. This matters when a new supported
+    // type (such as SRT) is added after a project has persisted its config.
+    // Explicit exclusions and the size limit still apply.
+    const selectedExtension = getSourceWatchExtension(sourcePath)
+    const manualImportConfig = selectedExtension && !cfg.includeExtensions.includes(selectedExtension)
+      ? { ...cfg, includeExtensions: [...cfg.includeExtensions, selectedExtension] }
+      : cfg
+    let allowed = isPathAllowedBySourceWatch(sourcePath, manualImportConfig)
     if (allowed) {
       try {
         allowed = await getFileSize(sourcePath) <= maxBytes
