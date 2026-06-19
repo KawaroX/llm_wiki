@@ -54,6 +54,12 @@ describe("source-lifecycle path helpers", () => {
     expect(isIngestableSourcePath("/project/raw/sources/.cache/report.pdf.txt")).toBe(false)
   })
 
+  it("treats subtitle files as ingestable sources", () => {
+    expect(isIngestableSourcePath("raw/sources/class.srt")).toBe(true)
+    expect(isIngestableSourcePath("raw/sources/class.lrc")).toBe(true)
+    expect(isIngestableSourcePath("raw/sources/class.vtt")).toBe(true)
+  })
+
   it("derives folder context from absolute raw/sources paths without leaking the project prefix", () => {
     expect(
       folderContextForSourcePath("/tmp/project/raw/sources/reports/2026/report.pdf"),

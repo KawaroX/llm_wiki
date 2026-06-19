@@ -39,6 +39,14 @@ import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pip
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
+import {
+  buildSubtitleAnalysisPrompt,
+  buildSubtitleGenerationPrompt,
+  buildSubtitleGenerationUserPrompt,
+  buildSubtitleSourceContext,
+  isSubtitleSourcePath,
+  parseSubtitleAnalysisResponse,
+} from "@/lib/subtitle-ingest"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -508,6 +516,7 @@ async function autoIngestImpl(
   // ── MinerU preprocessing for PDF files ──
   const lowerExt = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() : ""
   const isPdf = lowerExt === "pdf"
+  const isSubtitleSource = isSubtitleSourcePath(sp)
   const mineruCfg = useWikiStore.getState().mineruConfig
   let mineruSucceeded = false
   if (isPdf && mineruCfg.enabled && mineruCfg.token) {
@@ -772,7 +781,7 @@ async function autoIngestImpl(
   let precomputedAnalysis = ""
   let longSourceCheckpointPath: string | undefined
 
-  if (enrichedSourceContent.length > sourceBudget) {
+  if (!isSubtitleSource && enrichedSourceContent.length > sourceBudget) {
     const longSourcePlan = await analyzeLongSourceInChunks(
       pp,
       llmConfig,
@@ -794,23 +803,29 @@ async function autoIngestImpl(
     }
   }
 
-  // ── Step 1: Analysis ──────────────────────────────────────────
-  // LLM reads the source and produces a structured analysis:
-  // key entities, concepts, main arguments, connections to existing wiki, contradictions
-  activity.updateItem(activityId, {
-    detail: precomputedAnalysis
-      ? "Step 1/2: Consolidating long-source analysis..."
-      : "Step 1/2: Analyzing source...",
-  })
-
   let analysis = precomputedAnalysis
+  let generation = ""
 
-  if (!analysis) {
+  if (isSubtitleSource) {
+    // ── Subtitle Step 1: legal knowledge-point extraction ─────────
+    activity.updateItem(activityId, {
+      detail: "Step 1/2: Extracting subtitle knowledge points...",
+    })
+    analysis = ""
+    const subtitleAnalysisPrompt = buildSubtitleAnalysisPrompt({
+      purpose,
+      index,
+      sourceIdentity,
+      folderContext,
+      sourceContent: enrichedSourceContent,
+      maxSourceChars: sourceBudget,
+    })
+
     await streamChat(
       llmConfig,
       [
-        { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext) },
-        { role: "user", content: `Analyze this source document:\n\n**File:** ${sourceIdentity}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${sourceContext}` },
+        { role: "system", content: subtitleAnalysisPrompt.system },
+        { role: "user", content: subtitleAnalysisPrompt.user },
       ],
       {
         onToken: (token) => { analysis += token },
@@ -820,67 +835,152 @@ async function autoIngestImpl(
         },
       },
       signal,
-      { temperature: 0.1, reasoning: { mode: "off" }, max_tokens: 4096 },
+      {
+        temperature: 0.1,
+        reasoning: { mode: "off" },
+        max_tokens: Math.min(12_288, computeIngestGenerationMaxTokens(llmConfig.maxContextSize)),
+      },
+    )
+
+    const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
+    if (analysisActivity?.status === "error") {
+      throw new Error(analysisActivity.detail || "Analysis stream failed")
+    }
+
+    const subtitleAnalysis = parseSubtitleAnalysisResponse(analysis)
+    if (subtitleAnalysis.knowledge_points.length === 0) {
+      console.warn(`[ingest:subtitle] no knowledge_points parsed for "${sourceIdentity}"; generation will fall back to available transcript context`)
+    }
+    sourceContext = buildSubtitleSourceContext({
+      sourceIdentity,
+      sourceContent: enrichedSourceContent,
+      analysis: subtitleAnalysis,
+      folderContext,
+      maxChars: sourceBudget,
+    })
+
+    // ── Subtitle Step 2: page generation from timestamped segments ─
+    activity.updateItem(activityId, { detail: "Step 2/2: Generating subtitle wiki pages..." })
+    await streamChat(
+      llmConfig,
+      [
+        {
+          role: "system",
+          content: buildSubtitleGenerationPrompt(
+            buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath),
+          ),
+        },
+        {
+          role: "user",
+          content: buildSubtitleGenerationUserPrompt({
+            sourceIdentity,
+            analysisRaw: analysis,
+            analysis: subtitleAnalysis,
+            sourceContent: enrichedSourceContent,
+            folderContext,
+            maxContextChars: sourceBudget,
+          }),
+        },
+      ],
+      {
+        onToken: (token) => { generation += token },
+        onDone: () => {},
+        onError: (err) => {
+          activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
+        },
+      },
+      signal,
+      {
+        temperature: 0.1,
+        reasoning: { mode: "off" },
+        max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
+      },
+    )
+  } else {
+    // ── Step 1: Analysis ──────────────────────────────────────────
+    // LLM reads the source and produces a structured analysis:
+    // key entities, concepts, main arguments, connections to existing wiki, contradictions
+    activity.updateItem(activityId, {
+      detail: precomputedAnalysis
+        ? "Step 1/2: Consolidating long-source analysis..."
+        : "Step 1/2: Analyzing source...",
+    })
+
+    if (!analysis) {
+      await streamChat(
+        llmConfig,
+        [
+          { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext) },
+          { role: "user", content: `Analyze this source document:\n\n**File:** ${sourceIdentity}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${sourceContext}` },
+        ],
+        {
+          onToken: (token) => { analysis += token },
+          onDone: () => {},
+          onError: (err) => {
+            activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
+          },
+        },
+        signal,
+        { temperature: 0.1, reasoning: { mode: "off" }, max_tokens: 4096 },
+      )
+    }
+
+    // A silent `return []` here would look like success to the queue
+    // runner and cause the task to be filter()'d out. Throw instead so
+    // processNext's catch-block path (retry / mark failed) engages.
+    const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
+    if (analysisActivity?.status === "error") {
+      throw new Error(analysisActivity.detail || "Analysis stream failed")
+    }
+
+    // ── Step 2: Generation ────────────────────────────────────────
+    // LLM takes the analysis as context and produces wiki files + review items
+    activity.updateItem(activityId, { detail: "Step 2/2: Generating wiki pages..." })
+
+    await streamChat(
+      llmConfig,
+      [
+        { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath) },
+        {
+          role: "user",
+          content: [
+            `Source document to process: **${sourceIdentity}**`,
+            "",
+            "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
+            "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
+            "blocks as specified in the system prompt — nothing else.",
+            "",
+            "## Stage 1 Analysis (context only — do not repeat)",
+            "",
+            analysis,
+            "",
+            "## Source Context",
+            "",
+            sourceContext,
+            "",
+            "---",
+            "",
+            `Now emit the FILE blocks for the wiki files derived from **${sourceIdentity}**.`,
+            "Your response MUST begin with `---FILE:` as the very first characters.",
+            "No preamble. No analysis prose. Start immediately.",
+          ].join("\n"),
+        },
+      ],
+      {
+        onToken: (token) => { generation += token },
+        onDone: () => {},
+        onError: (err) => {
+          activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
+        },
+      },
+      signal,
+      {
+        temperature: 0.1,
+        reasoning: { mode: "off" },
+        max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
+      },
     )
   }
-
-  // A silent `return []` here would look like success to the queue
-  // runner and cause the task to be filter()'d out. Throw instead so
-  // processNext's catch-block path (retry / mark failed) engages.
-  const analysisActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
-  if (analysisActivity?.status === "error") {
-    throw new Error(analysisActivity.detail || "Analysis stream failed")
-  }
-
-  // ── Step 2: Generation ────────────────────────────────────────
-  // LLM takes the analysis as context and produces wiki files + review items
-  activity.updateItem(activityId, { detail: "Step 2/2: Generating wiki pages..." })
-
-  let generation = ""
-
-  await streamChat(
-    llmConfig,
-    [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath) },
-      {
-        role: "user",
-        content: [
-          `Source document to process: **${sourceIdentity}**`,
-          "",
-          "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
-          "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
-          "blocks as specified in the system prompt — nothing else.",
-          "",
-          "## Stage 1 Analysis (context only — do not repeat)",
-          "",
-          analysis,
-          "",
-          "## Source Context",
-          "",
-          sourceContext,
-          "",
-          "---",
-          "",
-          `Now emit the FILE blocks for the wiki files derived from **${sourceIdentity}**.`,
-          "Your response MUST begin with `---FILE:` as the very first characters.",
-          "No preamble. No analysis prose. Start immediately.",
-        ].join("\n"),
-      },
-    ],
-    {
-      onToken: (token) => { generation += token },
-      onDone: () => {},
-      onError: (err) => {
-        activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
-      },
-    },
-    signal,
-    {
-      temperature: 0.1,
-      reasoning: { mode: "off" },
-      max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
-    },
-  )
 
   const generationActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
   if (generationActivity?.status === "error") {

@@ -481,6 +481,7 @@
         "excludeGlobsHint": "Use comma-separated patterns such as *.draft.*, ~$*, .~lock.*#.",
         "groups": {
           "documents": "Documents",
+          "subtitles": "Subtitles",
           "presentations": "Presentations",
           "spreadsheets": "Spreadsheets",
           "web": "Web documents",

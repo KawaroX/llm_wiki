@@ -10,6 +10,10 @@ export const SOURCE_WATCH_FILE_TYPE_GROUPS = [
     extensions: ["md", "mdx", "txt", "pdf", "doc", "docx", "odt", "rtf"],
   },
   {
+    id: "subtitles",
+    extensions: ["srt", "lrc", "vtt"],
+  },
+  {
     id: "presentations",
     extensions: ["pptx", "odp"],
   },

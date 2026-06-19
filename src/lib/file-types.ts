@@ -19,6 +19,9 @@ const EXT_MAP: Record<string, FileCategory> = {
   txt: "text",
   rtf: "text",
   log: "text",
+  srt: "text",
+  lrc: "text",
+  vtt: "text",
 
   // Code
   js: "code",

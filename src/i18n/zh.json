@@ -481,6 +481,7 @@
         "excludeGlobsHint": "用逗号分隔模式，例如 *.draft.*、~$*、.~lock.*#。",
         "groups": {
           "documents": "文档",
+          "subtitles": "字幕",
           "presentations": "演示文稿",
           "spreadsheets": "表格",
           "web": "网页文档",

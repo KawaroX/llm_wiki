@@ -111,6 +111,10 @@ export function SourcesView() {
           ],
         },
         {
+          name: "Subtitles",
+          extensions: ["srt", "lrc", "vtt"],
+        },
+        {
           name: "Data",
           extensions: ["json", "jsonl", "csv", "tsv", "yaml", "yml", "ndjson"],
         },
