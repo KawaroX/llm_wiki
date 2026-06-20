@@ -268,45 +268,8 @@ describe("ingest scenarios (fixture-driven)", () => {
         concept_structure: {},
         teaching_insights: {},
       }),
-      [
-        "---FILE: wiki/sources/law-lecture.md---",
-        "---",
-        "type: source",
-        'title: "Source: law-lecture.srt"',
-        "created: 2026-06-19",
-        "updated: 2026-06-19",
-        "tags: [法考, 民法]",
-        "related: [要约]",
-        'sources: ["law-lecture.srt"]',
-        "---",
-        "",
-        "# 合同法课程",
-        "",
-        "本课程讲解要约。",
-        "---END FILE---",
-        "",
-        "---FILE: wiki/concepts/要约.md---",
-        "---",
-        "type: concept",
-        'title: "要约"',
-        "created: 2026-06-19",
-        "updated: 2026-06-19",
-        "tags: [法考, 民法, 合同法]",
-        "related: []",
-        'sources: ["law-lecture.srt"]',
-        "---",
-        "",
-        "# 要约",
-        "",
-        "## 核心定义",
-        "",
-        "要约是希望和他人订立合同的意思表示。",
-        "",
-        "## 时间戳",
-        "",
-        "00:00:01-00:00:08",
-        "---END FILE---",
-      ].join("\n"),
+      "The model returned prose instead of FILE blocks.",
+      "The focused call also ignored the required FILE format.",
     ]
 
     const written = await autoIngest(
@@ -322,12 +285,16 @@ describe("ingest scenarios (fixture-driven)", () => {
     const sourcePage = await readFileRaw(`${projectPath}/wiki/sources/law-lecture.md`)
     const conceptPage = await readFileRaw(`${projectPath}/wiki/concepts/要约.md`)
     expect(sourcePage).toContain("合同法课程")
+    expect(sourcePage).toContain('related: ["要约"]')
+    expect(sourcePage).toContain("## 知识点索引")
+    expect(sourcePage).toContain("[[要约]]")
+    expect(sourcePage).not.toContain('"knowledge_points"')
     expect(sourcePage).toContain('url: "https://www.bilibili.com/video/BV1course"')
     expect(sourcePage).toContain('course_url: "https://www.bilibili.com/video/BV1course"')
     expect(conceptPage).toContain("要约是希望和他人订立合同")
     expect(conceptPage).toContain('course_url: "https://www.bilibili.com/video/BV1course"')
-    expect(conceptPage).toContain("[00:00:01](https://www.bilibili.com/video/BV1course?t=1)")
-    expect(conceptPage).toContain("[00:00:08](https://www.bilibili.com/video/BV1course?t=8)")
+    expect(conceptPage).toContain("[00:01](https://www.bilibili.com/video/BV1course?t=1)")
+    expect(conceptPage).toContain("[00:08](https://www.bilibili.com/video/BV1course?t=8)")
 
     const analysisCall = mockStreamChat.mock.calls.find(([, messages]) =>
       typeof messages[0]?.content === "string" &&
@@ -343,6 +310,12 @@ describe("ingest scenarios (fixture-driven)", () => {
     expect(generationCall?.[1][1].content).toContain("要约的内容应当具体确定")
     expect(generationCall?.[1][1].content).toContain("Course URL: https://www.bilibili.com/video/BV1course")
     expect(generationCall?.[1][1].content).toContain("https://www.bilibili.com/video/BV1course?t=1")
+    const focusedCall = mockStreamChat.mock.calls.find(([, messages]) =>
+      typeof messages[0]?.content === "string" &&
+      messages[0].content.includes("Focused Subtitle Knowledge-Point Mode"),
+    )
+    expect(focusedCall).toBeTruthy()
+    expect(focusedCall?.[1][1].content).toContain("Required path: wiki/concepts/要约.md")
   })
 
   it("drops generated pages whose frontmatter type disagrees with schema routing", async () => {

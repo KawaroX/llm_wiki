@@ -397,6 +397,159 @@ export function buildSubtitleGenerationPrompt(baseGenerationPrompt: string): str
   ].join("\n")
 }
 
+export function buildSubtitleKnowledgePointGenerationPrompt(
+  basePrompt: string,
+  suggestedPath: string,
+): string {
+  return [
+    basePrompt,
+    "",
+    "## Focused Subtitle Knowledge-Point Mode",
+    "",
+    "Generate exactly ONE concept page for the single knowledge point supplied by the user.",
+    `Use this exact path: ${suggestedPath}`,
+    "Do not generate source, index, overview, log, entity, review, or additional concept blocks.",
+    "Return exactly one FILE block and no other text.",
+  ].join("\n")
+}
+
+export function buildSubtitleKnowledgePointUserPrompt(args: {
+  sourceIdentity: string
+  segment: SubtitleSegment
+  courseUrl?: string
+}): string {
+  return [
+    `Source subtitle: ${args.sourceIdentity}`,
+    args.courseUrl ? `Course URL: ${args.courseUrl}` : "",
+    `Required path: ${args.segment.suggestedPath}`,
+    `Time range: ${args.segment.timeRange || "(not specified)"}`,
+    "",
+    "Knowledge point JSON:",
+    JSON.stringify(args.segment.knowledgePoint, null, 2),
+    "",
+    "Matched subtitle segment:",
+    args.segment.content,
+    "",
+    `Emit exactly one FILE block for ${args.segment.suggestedPath}.`,
+  ].filter(Boolean).join("\n")
+}
+
+export function buildSubtitleSourceSummaryMarkdown(args: {
+  sourceIdentity: string
+  analysis: SubtitleAnalysis
+  courseUrl?: string
+  date: string
+}): string {
+  const overview = isRecord(args.analysis.course_overview) ? args.analysis.course_overview : {}
+  const title = firstString(overview.title, overview.course_title, overview.main_topic)
+    || args.sourceIdentity.replace(/\.[^.]+$/, "")
+  const subject = firstString(overview.subject)
+  const theme = firstString(overview.main_theme, overview.main_topic)
+  const examOrientation = firstString(overview.exam_orientation)
+  const knowledgeEntries = args.analysis.knowledge_points.map((kp, index) => {
+    const name = knowledgePointName(kp, index)
+    const target = makeQuerySlug(name)
+    const wikilink = target === name ? `[[${name}]]` : `[[${target}|${name}]]`
+    return { kp, name, target, wikilink }
+  })
+  const related = [...new Set(knowledgeEntries.map(({ name, target }) =>
+    target === name ? name : `[[${target}|${name}]]`,
+  ))]
+  const tags = [...new Set([subject, "法考", "字幕课程"].filter(Boolean))]
+  const knowledgeLines = knowledgeEntries.map(({ kp, wikilink }) => {
+    const timeRange = stringifyTimeRange(kp.time_range)
+    const linkedRange = timeRange && args.courseUrl
+      ? linkifySubtitleTimestamps(timeRange, args.courseUrl)
+      : timeRange
+    const definition = firstString(kp.core_definition)
+    return `- ${wikilink}${linkedRange ? ` · ${linkedRange}` : ""}${definition ? ` — ${definition}` : ""}`
+  })
+
+  return [
+    "---",
+    "type: source",
+    `title: ${JSON.stringify(title)}`,
+    `created: ${args.date}`,
+    `updated: ${args.date}`,
+    `tags: ${JSON.stringify(tags)}`,
+    `related: ${JSON.stringify(related)}`,
+    `sources: ${JSON.stringify([args.sourceIdentity])}`,
+    ...(args.courseUrl
+      ? [`url: ${JSON.stringify(args.courseUrl)}`, `course_url: ${JSON.stringify(args.courseUrl)}`]
+      : []),
+    "---",
+    "",
+    `# ${title}`,
+    "",
+    "## 课程概述",
+    "",
+    ...(subject ? [`- 科目：${subject}`] : []),
+    ...(theme ? [`- 主题：${theme}`] : []),
+    ...(examOrientation ? [`- 考试导向：${examOrientation}`] : []),
+    "",
+    "## 知识点索引",
+    "",
+    ...(knowledgeLines.length > 0 ? knowledgeLines : ["（未识别到知识点）"]),
+    "",
+  ].join("\n")
+}
+
+export function buildSubtitleKnowledgePointMarkdown(args: {
+  sourceIdentity: string
+  segment: SubtitleSegment
+  analysis: SubtitleAnalysis
+  courseUrl?: string
+  date: string
+}): string {
+  const kp = args.segment.knowledgePoint
+  const overview = isRecord(args.analysis.course_overview) ? args.analysis.course_overview : {}
+  const name = knowledgePointName(kp, 0)
+  const subject = firstString(overview.subject)
+  const tags = [...new Set(["法考", subject, firstString(kp.concept_type)].filter(Boolean))]
+  const timeRange = args.segment.timeRange || stringifyTimeRange(kp.time_range)
+  const linkedRange = timeRange && args.courseUrl
+    ? linkifySubtitleTimestamps(timeRange, args.courseUrl)
+    : timeRange
+
+  const sections: Array<[string, unknown]> = [
+    ["核心定义", kp.core_definition],
+    ["详细内容", kp.detailed_content],
+    ["考试关联", kp.exam_relevance],
+    ["教师强调", kp.teacher_emphasis],
+    ["例题与提示", kp.examples],
+    ["易混点", kp.common_traps],
+    ["记忆要点", kp.memory_tips],
+  ]
+
+  const bodySections = sections.flatMap(([heading, value]) => {
+    const rendered = renderKnowledgeValue(value)
+    return rendered ? [`## ${heading}`, "", rendered, ""] : []
+  })
+
+  return [
+    "---",
+    "type: concept",
+    `title: ${JSON.stringify(name)}`,
+    `created: ${args.date}`,
+    `updated: ${args.date}`,
+    `tags: ${JSON.stringify(tags)}`,
+    "related: []",
+    `sources: ${JSON.stringify([args.sourceIdentity])}`,
+    ...(args.courseUrl ? [`course_url: ${JSON.stringify(args.courseUrl)}`] : []),
+    ...(timeRange ? [`time_range: ${JSON.stringify(timeRange)}`] : []),
+    "---",
+    "",
+    `# ${name}`,
+    "",
+    ...bodySections,
+    ...(linkedRange ? ["## 时间戳", "", linkedRange, ""] : []),
+    "## 课程原文摘录",
+    "",
+    trimLongText(args.segment.content, 5000),
+    "",
+  ].join("\n")
+}
+
 export function buildSubtitleGenerationUserPrompt(args: {
   sourceIdentity: string
   analysisRaw: string
@@ -716,6 +869,27 @@ function stringifyTimeRange(value: unknown): string {
 
 function extractFirstUrl(text: string): string | undefined {
   return text.match(/https?:\/\/[^\s<>"')]+/i)?.[0]
+}
+
+function renderKnowledgeValue(value: unknown): string {
+  if (value === undefined || value === null || value === "") return ""
+  if (typeof value === "string") return value.trim()
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => renderKnowledgeValue(item))
+      .filter(Boolean)
+      .map((item) => `- ${item.replace(/\n/g, "\n  ")}`)
+      .join("\n")
+  }
+  if (isRecord(value)) {
+    return Object.entries(value)
+      .map(([key, item]) => [key, renderKnowledgeValue(item)] as const)
+      .filter(([, item]) => !!item)
+      .map(([key, item]) => `- **${key}**：${item.replace(/\n/g, "\n  ")}`)
+      .join("\n")
+  }
+  return String(value)
 }
 
 function jsonPreview(value: unknown, maxChars: number): string {

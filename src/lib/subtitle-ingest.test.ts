@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   buildSubtitleAnalysisChunks,
   buildSubtitleSourceContext,
+  buildSubtitleSourceSummaryMarkdown,
   createTimestampLink,
   decorateSubtitleMarkdown,
   linkifySubtitleTimestamps,
@@ -118,6 +119,26 @@ describe("subtitle ingest helpers", () => {
     expect(segments[0].suggestedPath).toBe("wiki/concepts/要约.md")
     expect(segments[0].content).toContain("要约是希望和他人订立合同")
     expect(segments[0].content).not.toContain("承诺到达")
+  })
+
+  it("links source-summary titles to normalized concept filenames", () => {
+    const markdown = buildSubtitleSourceSummaryMarkdown({
+      sourceIdentity: "criminal-law.srt",
+      date: "2026-06-21",
+      analysis: {
+        knowledge_points: [{
+          concept_name: "同一用语的含义相对化（一词多义）",
+          time_range: "00:29:15-00:32:06",
+        }],
+      },
+    })
+
+    expect(markdown).toContain(
+      'related: ["[[同一用语的含义相对化一词多义|同一用语的含义相对化（一词多义）]]"]',
+    )
+    expect(markdown).toContain(
+      "[[同一用语的含义相对化一词多义|同一用语的含义相对化（一词多义）]]",
+    )
   })
 
   it("trims matched subtitle segments without cutting through subtitle entries", () => {

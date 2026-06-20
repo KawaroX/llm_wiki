@@ -45,11 +45,18 @@ import {
   buildSubtitleAnalysisPrompt,
   buildSubtitleGenerationPrompt,
   buildSubtitleGenerationUserPrompt,
+  buildSubtitleKnowledgePointGenerationPrompt,
+  buildSubtitleKnowledgePointMarkdown,
+  buildSubtitleKnowledgePointUserPrompt,
   buildSubtitleSourceContext,
+  buildSubtitleSourceSummaryMarkdown,
   decorateSubtitleMarkdown,
   isSubtitleSourcePath,
   mergeSubtitleAnalyses,
   parseSubtitleAnalysisResponse,
+  segmentSubtitleByKnowledgePoints,
+  type SubtitleAnalysis,
+  type SubtitleSegment,
 } from "@/lib/subtitle-ingest"
 import { getSourceCourseUrl } from "@/lib/source-metadata"
 
@@ -65,6 +72,8 @@ const INGEST_GENERATION_TOKENS_256K = 24_576
 const INGEST_GENERATION_TOKENS_512K = 32_768
 const REVIEW_STAGE_MIN_SIGNAL_CHARS = 10_000
 const REVIEW_STAGE_MIN_FILE_BLOCKS = 4
+const SUBTITLE_INGEST_CACHE_VERSION = 2
+const SUBTITLE_KNOWLEDGE_GENERATION_CONCURRENCY = 4
 const AGGREGATE_WIKI_PATHS = ["wiki/index.md", "wiki/overview.md", "wiki/log.md"] as const
 
 function appendSavedImageRefsForCaption(content: string, images: SavedImage[]): string {
@@ -561,8 +570,13 @@ async function autoIngestImpl(
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
   const courseUrl = isSubtitleSource ? await getSourceCourseUrl(pp, sp) : ""
-  const sourceCacheContent = courseUrl
-    ? `${sourceContent}\n\n[llm-wiki course_url: ${courseUrl}]`
+  const sourceCacheContent = isSubtitleSource
+    ? [
+        sourceContent,
+        "",
+        `[llm-wiki subtitle pipeline: ${SUBTITLE_INGEST_CACHE_VERSION}]`,
+        courseUrl ? `[llm-wiki course_url: ${courseUrl}]` : "",
+      ].filter(Boolean).join("\n")
     : sourceContent
 
   // ── Cache check: skip re-ingest if source content hasn't changed ──
@@ -814,6 +828,7 @@ async function autoIngestImpl(
 
   let analysis = precomputedAnalysis
   let generation = ""
+  let subtitleAnalysis: SubtitleAnalysis | null = null
 
   if (isSubtitleSource) {
     // ── Subtitle Step 1: legal knowledge-point extraction ─────────
@@ -931,7 +946,7 @@ async function autoIngestImpl(
         : JSON.stringify(mergeSubtitleAnalyses(chunkAnalyses.map(parseSubtitleAnalysisResponse)), null, 2)
     }
 
-    let subtitleAnalysis = parseSubtitleAnalysisResponse(analysis)
+    subtitleAnalysis = parseSubtitleAnalysisResponse(analysis)
     if (subtitleAnalysis.knowledge_points.length === 0 && chunkAnalyses.length > 1) {
       subtitleAnalysis = mergeSubtitleAnalyses(chunkAnalyses.map(parseSubtitleAnalysisResponse))
       analysis = JSON.stringify(subtitleAnalysis, null, 2)
@@ -1140,6 +1155,115 @@ async function autoIngestImpl(
   const writeWarnings = writeResult.warnings
   const hardFailures = writeResult.hardFailures
 
+  if (isSubtitleSource && subtitleAnalysis && subtitleAnalysis.knowledge_points.length > 0) {
+    const segments = segmentSubtitleByKnowledgePoints({
+      sourceIdentity,
+      sourceContent: enrichedSourceContent,
+      analysis: subtitleAnalysis,
+      courseUrl,
+      maxSegmentChars: Math.max(4000, Math.floor(sourceBudget / Math.max(1, subtitleAnalysis.knowledge_points.length))),
+    })
+    const expectedPaths = [...new Set(segments.map((segment) => normalizePath(segment.suggestedPath)))]
+    const expectedPageCount = expectedPaths.length
+    let coveredPaths = await coveredSubtitleKnowledgePaths(
+      pp,
+      sourceIdentity,
+      expectedPaths,
+      writtenPaths,
+    )
+    let writtenPageCount = coveredPaths.size
+
+    if (writtenPageCount < expectedPageCount && !signal?.aborted) {
+      const missingSegments = segments.filter(
+        (segment) => !coveredPaths.has(normalizePath(segment.suggestedPath)),
+      )
+      activity.updateItem(activityId, {
+        detail: `Generating subtitle knowledge pages individually... ${writtenPageCount}/${expectedPageCount}`,
+      })
+      const focusedGeneration = await generateFocusedSubtitleKnowledgePages({
+        llmConfig,
+        schema,
+        purpose,
+        index,
+        sourceIdentity,
+        sourceSummaryPath,
+        segments: missingSegments,
+        courseUrl,
+        signal,
+        activityId,
+      })
+      const focusedWriteResult = await writeFileBlocks(
+        pp,
+        focusedGeneration,
+        llmConfig,
+        sourceIdentity,
+        sourceSummaryPath,
+        signal,
+        courseUrl,
+      )
+      writtenPaths.push(...focusedWriteResult.writtenPaths)
+      writeWarnings.push(...focusedWriteResult.warnings)
+      hardFailures.push(...focusedWriteResult.hardFailures)
+      coveredPaths = await coveredSubtitleKnowledgePaths(
+        pp,
+        sourceIdentity,
+        expectedPaths,
+        writtenPaths,
+      )
+      writtenPageCount = coveredPaths.size
+    }
+
+    if (writtenPageCount < expectedPageCount && !signal?.aborted) {
+      const date = currentWikiDate()
+      const missingSegments = segments.filter(
+        (segment) => !coveredPaths.has(normalizePath(segment.suggestedPath)),
+      )
+      const deterministicGeneration = missingSegments.map((segment) => [
+        `---FILE: ${segment.suggestedPath}---`,
+        buildSubtitleKnowledgePointMarkdown({
+          sourceIdentity,
+          segment,
+          analysis: subtitleAnalysis!,
+          courseUrl,
+          date,
+        }),
+        "---END FILE---",
+      ].join("\n")).join("\n\n")
+      const deterministicWriteResult = await writeFileBlocks(
+        pp,
+        deterministicGeneration,
+        llmConfig,
+        sourceIdentity,
+        sourceSummaryPath,
+        signal,
+        courseUrl,
+      )
+      writtenPaths.push(...deterministicWriteResult.writtenPaths)
+      writeWarnings.push(...deterministicWriteResult.warnings)
+      hardFailures.push(...deterministicWriteResult.hardFailures)
+      coveredPaths = await coveredSubtitleKnowledgePaths(
+        pp,
+        sourceIdentity,
+        expectedPaths,
+        writtenPaths,
+      )
+      writtenPageCount = coveredPaths.size
+    }
+
+    if (writtenPageCount < expectedPageCount) {
+      throw new Error(
+        `Subtitle generation incomplete: wrote ${writtenPageCount}/${expectedPageCount} knowledge pages`,
+      )
+    }
+    const writtenKeys = new Set(writtenPaths.map(normalizePath))
+    for (const path of coveredPaths) {
+      if (!writtenKeys.has(path)) {
+        writtenPaths.push(path)
+        writtenKeys.add(path)
+      }
+    }
+  }
+
   const aggregateRepairPaths = aggregatePathsNeedingRepair(writtenPaths, writeWarnings)
   const repairableAggregatePaths = aggregateRepairPaths.filter((path) =>
     isAggregateRepairSafe(path, index, overview, llmConfig.maxContextSize),
@@ -1244,23 +1368,29 @@ async function autoIngestImpl(
   // task for retry rather than "success".
   if (!hasSourceSummary && !signal?.aborted) {
     const date = new Date().toISOString().slice(0, 10)
-    const fallbackContent = [
-      "---",
-      `type: source`,
-      `title: "Source: ${sourceIdentity}"`,
-      `created: ${date}`,
-      `updated: ${date}`,
-      `sources: ["${sourceIdentity}"]`,
-      `tags: []`,
-      `related: []`,
-      ...(courseUrl ? [`url: ${JSON.stringify(courseUrl)}`, `course_url: ${JSON.stringify(courseUrl)}`] : []),
-      "---",
-      "",
-      `# Source: ${sourceIdentity}`,
-      "",
-      analysis ? analysis.slice(0, 3000) : "(Analysis not available)",
-      "",
-    ].join("\n")
+    const fallbackContent = isSubtitleSource && subtitleAnalysis
+      ? buildSubtitleSourceSummaryMarkdown({
+          sourceIdentity,
+          analysis: subtitleAnalysis,
+          courseUrl,
+          date,
+        })
+      : [
+          "---",
+          `type: source`,
+          `title: "Source: ${sourceIdentity}"`,
+          `created: ${date}`,
+          `updated: ${date}`,
+          `sources: ["${sourceIdentity}"]`,
+          `tags: []`,
+          `related: []`,
+          "---",
+          "",
+          `# Source: ${sourceIdentity}`,
+          "",
+          analysis ? analysis.slice(0, 3000) : "(Analysis not available)",
+          "",
+        ].join("\n")
     try {
       await writeFile(sourceSummaryFullPath, fallbackContent)
       writtenPaths.push(sourceSummaryPath)
@@ -1305,7 +1435,6 @@ async function autoIngestImpl(
   // chance to recover the failed ones. Soft drops (language
   // mismatch, path-traversal rejection, empty-path) are NOT failures
   // — they represent deterministic decisions and caching them is
-  // safe.
   if (writtenPaths.length > 0 && hardFailures.length === 0) {
     await saveIngestCache(pp, sourceIdentity, sourceCacheContent, writtenPaths)
     if (longSourceCheckpointPath) {
@@ -1350,6 +1479,118 @@ async function autoIngestImpl(
   })
 
   return writtenPaths
+}
+
+async function coveredSubtitleKnowledgePaths(
+  projectPath: string,
+  sourceIdentity: string,
+  expectedPaths: string[],
+  writtenPaths: string[],
+): Promise<Set<string>> {
+  const expected = new Set(expectedPaths.map(normalizePath))
+  const covered = new Set(
+    writtenPaths.map(normalizePath).filter((path) => expected.has(path)),
+  )
+  for (const path of expected) {
+    if (covered.has(path)) continue
+    try {
+      const fullPath = `${projectPath}/${path}`
+      if (!(await fileExists(fullPath))) continue
+      const existing = await readFile(fullPath)
+      const updated = canonicalizeSourcesField(existing, sourceIdentity)
+      if (updated !== existing) await writeFile(fullPath, updated)
+      covered.add(path)
+    } catch {
+      // Missing or unreadable pages remain uncovered and use fallback generation.
+    }
+  }
+  return covered
+}
+
+async function generateFocusedSubtitleKnowledgePages(args: {
+  llmConfig: LlmConfig
+  schema: string
+  purpose: string
+  index: string
+  sourceIdentity: string
+  sourceSummaryPath: string
+  segments: SubtitleSegment[]
+  courseUrl?: string
+  signal?: AbortSignal
+  activityId: string
+}): Promise<string> {
+  if (args.segments.length === 0) return ""
+  const outputs = new Array<string>(args.segments.length).fill("")
+  const activity = useActivityStore.getState()
+  let nextIndex = 0
+  let completed = 0
+
+  async function worker(): Promise<void> {
+    while (nextIndex < args.segments.length && !args.signal?.aborted) {
+      const index = nextIndex++
+      const segment = args.segments[index]
+      let output = ""
+      try {
+        const basePrompt = buildGenerationPrompt(
+          args.schema,
+          args.purpose,
+          args.index,
+          args.sourceIdentity,
+          "",
+          segment.content,
+          args.sourceSummaryPath,
+        )
+        await streamChat(
+          args.llmConfig,
+          [
+            {
+              role: "system",
+              content: buildSubtitleKnowledgePointGenerationPrompt(basePrompt, segment.suggestedPath),
+            },
+            {
+              role: "user",
+              content: buildSubtitleKnowledgePointUserPrompt({
+                sourceIdentity: args.sourceIdentity,
+                segment,
+                courseUrl: args.courseUrl,
+              }),
+            },
+          ],
+          {
+            onToken: (token) => { output += token },
+            onDone: () => {},
+            onError: (err) => {
+              console.warn(
+                `[ingest:subtitle] focused generation failed for ${segment.suggestedPath}: ${err.message}`,
+              )
+            },
+          },
+          args.signal,
+          {
+            temperature: 0.1,
+            reasoning: { mode: "off" },
+            max_tokens: 4096,
+          },
+        )
+      } catch (err) {
+        if (args.signal?.aborted) throw err
+        console.warn(
+          `[ingest:subtitle] focused generation failed for ${segment.suggestedPath}:`,
+          err instanceof Error ? err.message : err,
+        )
+      }
+      outputs[index] = output
+      completed++
+      activity.updateItem(args.activityId, {
+        detail: `Generating subtitle knowledge pages individually... ${completed}/${args.segments.length}`,
+      })
+    }
+  }
+
+  const workerCount = Math.min(SUBTITLE_KNOWLEDGE_GENERATION_CONCURRENCY, args.segments.length)
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  if (args.signal?.aborted) throw new Error("Ingest cancelled")
+  return outputs.filter((output) => output.trim()).join("\n\n")
 }
 
 /**
