@@ -6,6 +6,7 @@ import {
   createTimestampLink,
   decorateSubtitleMarkdown,
   linkifySubtitleTimestamps,
+  normalizeSubtitleConceptAnalysis,
   parseSubtitleAnalysisResponse,
   parseSubtitleContent,
   parseTimeToSeconds,
@@ -139,6 +140,64 @@ describe("subtitle ingest helpers", () => {
     expect(markdown).toContain(
       "[[同一用语的含义相对化一词多义|同一用语的含义相对化（一词多义）]]",
     )
+  })
+
+  it("folds subtitle examples and subrules into parent concept pages", () => {
+    const analysis = {
+      course_overview: { title: "犯罪客体、犯罪主体", subject: "刑法" },
+      knowledge_points: [
+        { concept_name: "犯罪客体", time_range: "00:18-00:59" },
+        { concept_name: "犯罪对象", time_range: "01:04-01:28" },
+        { concept_name: "法益的解释功能", time_range: "01:36-02:55" },
+        { concept_name: "非法侵入住宅罪的保护法益", time_range: "02:58-06:40" },
+        { concept_name: "保护法益与保障人权的冲突", time_range: "08:46-10:27" },
+        { concept_name: "肖申克救赎案：脱逃罪的认定", time_range: "10:29-13:01" },
+        { concept_name: "真正身份犯（定罪身份）", time_range: "14:44-15:11" },
+        { concept_name: "定罪身份的形成时间要求", time_range: "15:14-16:25" },
+        { concept_name: "定罪身份只针对实行犯", time_range: "17:26-18:00" },
+        { concept_name: "不真正身份犯（量刑身份）", time_range: "18:06-19:02" },
+        { concept_name: "国家工作人员的认定标准（公务说）", time_range: "19:57-20:50" },
+        { concept_name: "村干部是否属于国家工作人员", time_range: "23:50-24:42" },
+        { concept_name: "国家工作人员身份的临时可切换性", time_range: "24:53-26:38" },
+        { concept_name: "纯正的单位犯罪", time_range: "26:53-27:17" },
+        { concept_name: "不纯正的单位犯罪", time_range: "27:17-27:37" },
+        { concept_name: "纯正的自然人犯罪", time_range: "27:42-28:37" },
+        { concept_name: "单位犯罪的主体条件（法人资格）", time_range: "28:48-30:56" },
+        { concept_name: "单位犯罪的主观条件（单位意志）", time_range: "31:01-31:38" },
+        { concept_name: "单位犯罪可以是过失犯罪", time_range: "31:41-32:11" },
+        { concept_name: "揭开单位的面纱", time_range: "32:23-34:19" },
+        { concept_name: "单位犯罪与个人犯罪的区分标准", time_range: "34:29-35:09" },
+        { concept_name: "单位犯罪与个人犯罪的区分案例：集体私分", time_range: "35:46-36:56" },
+        { concept_name: "单位犯罪与个人犯罪的区分案例：个人为单位谋利", time_range: "36:58-38:18" },
+        { concept_name: "单位实施纯正的个人犯罪的处理", time_range: "39:07-39:45" },
+        { concept_name: "单位实施不纯正的单位犯罪的处理（各算各的账）", time_range: "43:11-47:36" },
+        { concept_name: "单位犯罪的处罚原则：双罚制与单罚制", time_range: "47:38-48:45" },
+        { concept_name: "单位犯罪后单位消灭的刑事责任追究", time_range: "48:48-49:51" },
+      ],
+      concept_structure: {},
+      teaching_insights: {},
+    }
+
+    const normalized = normalizeSubtitleConceptAnalysis(analysis)
+    const names = normalized.knowledge_points.map((kp) => kp.concept_name)
+
+    expect(names).toHaveLength(10)
+    expect(names).toContain("犯罪客体")
+    expect(names).toContain("国家工作人员的认定标准（公务说）")
+    expect(names).toContain("单位犯罪与个人犯罪的区分标准")
+    expect(names).not.toContain("肖申克救赎案：脱逃罪的认定")
+    expect(names).not.toContain("单位犯罪与个人犯罪的区分案例：集体私分")
+    expect(JSON.stringify(normalized)).toContain("单位犯罪后单位消灭的刑事责任追究")
+
+    const markdown = buildSubtitleSourceSummaryMarkdown({
+      sourceIdentity: "criminal-law.srt",
+      date: "2026-06-21",
+      analysis,
+    })
+    const relatedLine = markdown.match(/^related: (.+)$/m)?.[1] ?? ""
+    expect(relatedLine).toContain("犯罪客体")
+    expect(relatedLine).not.toContain("肖申克")
+    expect(relatedLine).not.toContain("集体私分")
   })
 
   it("trims matched subtitle segments without cutting through subtitle entries", () => {

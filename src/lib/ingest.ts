@@ -53,6 +53,7 @@ import {
   decorateSubtitleMarkdown,
   isSubtitleSourcePath,
   mergeSubtitleAnalyses,
+  normalizeSubtitleConceptAnalysis,
   parseSubtitleAnalysisResponse,
   segmentSubtitleByKnowledgePoints,
   type SubtitleAnalysis,
@@ -72,7 +73,7 @@ const INGEST_GENERATION_TOKENS_256K = 24_576
 const INGEST_GENERATION_TOKENS_512K = 32_768
 const REVIEW_STAGE_MIN_SIGNAL_CHARS = 10_000
 const REVIEW_STAGE_MIN_FILE_BLOCKS = 4
-const SUBTITLE_INGEST_CACHE_VERSION = 2
+const SUBTITLE_INGEST_CACHE_VERSION = 3
 const SUBTITLE_KNOWLEDGE_GENERATION_CONCURRENCY = 4
 const AGGREGATE_WIKI_PATHS = ["wiki/index.md", "wiki/overview.md", "wiki/log.md"] as const
 
@@ -829,6 +830,7 @@ async function autoIngestImpl(
   let analysis = precomputedAnalysis
   let generation = ""
   let subtitleAnalysis: SubtitleAnalysis | null = null
+  let subtitleConceptAnalysis: SubtitleAnalysis | null = null
 
   if (isSubtitleSource) {
     // ── Subtitle Step 1: legal knowledge-point extraction ─────────
@@ -954,10 +956,12 @@ async function autoIngestImpl(
     if (subtitleAnalysis.knowledge_points.length === 0) {
       console.warn(`[ingest:subtitle] no knowledge_points parsed for "${sourceIdentity}"; generation will fall back to available transcript context`)
     }
+    subtitleConceptAnalysis = normalizeSubtitleConceptAnalysis(subtitleAnalysis)
+    analysis = JSON.stringify(subtitleConceptAnalysis, null, 2)
     sourceContext = buildSubtitleSourceContext({
       sourceIdentity,
       sourceContent: enrichedSourceContent,
-      analysis: subtitleAnalysis,
+      analysis: subtitleConceptAnalysis,
       courseUrl,
       folderContext,
       maxChars: sourceBudget,
@@ -979,7 +983,7 @@ async function autoIngestImpl(
           content: buildSubtitleGenerationUserPrompt({
             sourceIdentity,
             analysisRaw: analysis,
-            analysis: subtitleAnalysis,
+            analysis: subtitleConceptAnalysis,
             sourceContent: enrichedSourceContent,
             courseUrl,
             folderContext,
@@ -1155,13 +1159,13 @@ async function autoIngestImpl(
   const writeWarnings = writeResult.warnings
   const hardFailures = writeResult.hardFailures
 
-  if (isSubtitleSource && subtitleAnalysis && subtitleAnalysis.knowledge_points.length > 0) {
+  if (isSubtitleSource && subtitleConceptAnalysis && subtitleConceptAnalysis.knowledge_points.length > 0) {
     const segments = segmentSubtitleByKnowledgePoints({
       sourceIdentity,
       sourceContent: enrichedSourceContent,
-      analysis: subtitleAnalysis,
+      analysis: subtitleConceptAnalysis,
       courseUrl,
-      maxSegmentChars: Math.max(4000, Math.floor(sourceBudget / Math.max(1, subtitleAnalysis.knowledge_points.length))),
+      maxSegmentChars: Math.max(4000, Math.floor(sourceBudget / Math.max(1, subtitleConceptAnalysis.knowledge_points.length))),
     })
     const expectedPaths = [...new Set(segments.map((segment) => normalizePath(segment.suggestedPath)))]
     const expectedPageCount = expectedPaths.length
@@ -1223,7 +1227,7 @@ async function autoIngestImpl(
         buildSubtitleKnowledgePointMarkdown({
           sourceIdentity,
           segment,
-          analysis: subtitleAnalysis!,
+          analysis: subtitleConceptAnalysis!,
           courseUrl,
           date,
         }),
@@ -1368,10 +1372,10 @@ async function autoIngestImpl(
   // task for retry rather than "success".
   if (!hasSourceSummary && !signal?.aborted) {
     const date = new Date().toISOString().slice(0, 10)
-    const fallbackContent = isSubtitleSource && subtitleAnalysis
+    const fallbackContent = isSubtitleSource && subtitleConceptAnalysis
       ? buildSubtitleSourceSummaryMarkdown({
           sourceIdentity,
-          analysis: subtitleAnalysis,
+          analysis: subtitleConceptAnalysis,
           courseUrl,
           date,
         })

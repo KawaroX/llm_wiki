@@ -56,6 +56,8 @@ interface TimeRange {
 const DEFAULT_SEGMENT_BUFFER_SECONDS = 30
 const DEFAULT_ANALYSIS_SOURCE_CHARS = 140_000
 const DEFAULT_CONTEXT_CHARS = 180_000
+const SUPPORTING_POINT_NAME_RE = /案例|例题|肖申克|形成时间要求|只针对|临时可切换性|是否属于|区分案例|各算各的账|主体条件|主观条件|处罚原则|单位消灭|撤销|注销|吊销|破产|揭开.*面纱|可以是|保护法益与保障人权|非法侵入住宅罪的保护法益|单位实施.*处理/
+const SUPPORTING_POINT_TYPE_RE = /实务经验|考试技巧|例题|案例/
 
 export function isSubtitleSourcePath(path: string): boolean {
   const name = path.replace(/\\/g, "/").split("/").pop() ?? ""
@@ -296,6 +298,38 @@ export function mergeSubtitleAnalyses(analyses: SubtitleAnalysis[]): SubtitleAna
   }
 }
 
+export function normalizeSubtitleConceptAnalysis(analysis: SubtitleAnalysis): SubtitleAnalysis {
+  const points = analysis.knowledge_points ?? []
+  if (points.length <= 1) return analysis
+
+  const explicitParents = buildExplicitParentLookup(analysis)
+  const candidateIndexes = new Set<number>()
+  points.forEach((kp, index) => {
+    if (isPageConceptCandidate(kp, explicitParents)) candidateIndexes.add(index)
+  })
+  if (candidateIndexes.size === 0 || candidateIndexes.size === points.length) return analysis
+
+  const pagePoints = points
+    .map((kp, index) => ({ kp: cloneKnowledgePoint(kp), index }))
+    .filter(({ index }) => candidateIndexes.has(index))
+  const pageNames = pagePoints.map(({ kp, index }) => knowledgePointName(kp, index))
+  const pageByName = new Map<string, SubtitleKnowledgePoint>()
+  pagePoints.forEach(({ kp, index }) => {
+    pageByName.set(normalizeConceptName(knowledgePointName(kp, index)), kp)
+  })
+
+  points.forEach((support, index) => {
+    if (candidateIndexes.has(index)) return
+    const parent = findSupportingPointParent(support, index, pageNames, pageByName, explicitParents, points)
+    if (parent) mergeSupportingPoint(parent, support, index)
+  })
+
+  return {
+    ...analysis,
+    knowledge_points: pagePoints.map(({ kp }) => kp),
+  }
+}
+
 export function buildSubtitleAnalysisPrompt(args: {
   purpose: string
   index: string
@@ -322,6 +356,7 @@ export function buildSubtitleAnalysisPrompt(args: {
       "Extraction rules:",
       "- Identify every independent legal-exam knowledge point, not only broad chapter headings.",
       "- Prefer fine-grained legal concepts, elements, procedure rules, judgment standards, statutory rules, and practical exam techniques.",
+      "- A knowledge point is an extraction unit, not necessarily a standalone wiki concept page. Preserve subrules, examples, traps, and exam tips here; the application will later fold supporting points into parent concept pages.",
       "- Preserve teacher emphasis, examples, contrasts, traps, and exam-facing wording.",
       "- Keep each knowledge point tied to the precise time range where it is explained.",
       "- Capture relationships such as prerequisite, contrast, exception, sequence, broader/narrower concept, and likely duplicate.",
@@ -382,11 +417,11 @@ export function buildSubtitleGenerationPrompt(baseGenerationPrompt: string): str
     "## Subtitle Course Mode",
     "",
     "This source is a legal-exam subtitle transcript processed with a two-stage course method.",
-    "Use the Stage 1 JSON knowledge points as the primary generation plan.",
+    "Use the Stage 1 JSON knowledge points as the primary generation plan. In this mode, the supplied knowledge points have already been collapsed to page-worthy legal-exam concepts; supporting points belong inside those concept pages, not as extra pages.",
     "",
     "Create useful wiki pages as follows:",
     "- Generate a source summary page at the exact source-summary path from the base prompt.",
-    "- Generate one focused concept page for each high-value legal knowledge point. Prefer one page per independent legal concept instead of one large course note.",
+    "- Generate one focused concept page for each supplied page-worthy legal concept. Prefer one page per independent legal concept instead of one large course note.",
     "- Use the suggested path supplied for each knowledge point when present.",
     "- Preserve teacher explanations, exam traps, examples, contrasts, and memory cues from the matched subtitle segment.",
     "- Include timestamp evidence in the body when a concept has a time range. Use the timestamp links supplied in the segment context.",
@@ -440,13 +475,14 @@ export function buildSubtitleSourceSummaryMarkdown(args: {
   courseUrl?: string
   date: string
 }): string {
-  const overview = isRecord(args.analysis.course_overview) ? args.analysis.course_overview : {}
+  const analysis = normalizeSubtitleConceptAnalysis(args.analysis)
+  const overview = isRecord(analysis.course_overview) ? analysis.course_overview : {}
   const title = firstString(overview.title, overview.course_title, overview.main_topic)
     || args.sourceIdentity.replace(/\.[^.]+$/, "")
   const subject = firstString(overview.subject)
   const theme = firstString(overview.main_theme, overview.main_topic)
   const examOrientation = firstString(overview.exam_orientation)
-  const knowledgeEntries = args.analysis.knowledge_points.map((kp, index) => {
+  const knowledgeEntries = analysis.knowledge_points.map((kp, index) => {
     const name = knowledgePointName(kp, index)
     const target = makeQuerySlug(name)
     const wikilink = target === name ? `[[${name}]]` : `[[${target}|${name}]]`
@@ -514,6 +550,7 @@ export function buildSubtitleKnowledgePointMarkdown(args: {
   const sections: Array<[string, unknown]> = [
     ["核心定义", kp.core_definition],
     ["详细内容", kp.detailed_content],
+    ["补充内容", kp.supporting_points],
     ["考试关联", kp.exam_relevance],
     ["教师强调", kp.teacher_emphasis],
     ["例题与提示", kp.examples],
@@ -600,12 +637,13 @@ export function buildSubtitleSourceContext(args: {
   const maxChars = args.maxChars ?? DEFAULT_CONTEXT_CHARS
   const lines = parseSubtitleContent(args.sourceContent, args.sourceIdentity)
   const courseUrl = args.courseUrl || extractFirstUrl(args.sourceContent)
+  const analysis = normalizeSubtitleConceptAnalysis(args.analysis)
   const segments = segmentSubtitleByKnowledgePoints({
     sourceIdentity: args.sourceIdentity,
     sourceContent: args.sourceContent,
-    analysis: args.analysis,
+    analysis,
     courseUrl,
-    maxSegmentChars: Math.max(1200, Math.floor(maxChars / Math.max(1, args.analysis.knowledge_points.length + 2))),
+    maxSegmentChars: Math.max(1200, Math.floor(maxChars / Math.max(1, analysis.knowledge_points.length + 2))),
   })
 
   const header = [
@@ -615,13 +653,13 @@ export function buildSubtitleSourceContext(args: {
     courseUrl ? `Course URL: ${courseUrl}` : "",
     "",
     "Course overview:",
-    jsonPreview(args.analysis.course_overview, 2500),
+    jsonPreview(analysis.course_overview, 2500),
     "",
     "Concept structure:",
-    jsonPreview(args.analysis.concept_structure, 2500),
+    jsonPreview(analysis.concept_structure, 2500),
     "",
     "Teaching insights:",
-    jsonPreview(args.analysis.teaching_insights, 2500),
+    jsonPreview(analysis.teaching_insights, 2500),
   ].filter(Boolean).join("\n")
 
   const body = segments.map((segment, idx) => [
@@ -890,6 +928,145 @@ function renderKnowledgeValue(value: unknown): string {
       .join("\n")
   }
   return String(value)
+}
+
+function cloneKnowledgePoint(kp: SubtitleKnowledgePoint): SubtitleKnowledgePoint {
+  return { ...kp }
+}
+
+function isPageConceptCandidate(kp: SubtitleKnowledgePoint, explicitParents: Map<string, string>): boolean {
+  const name = knowledgePointName(kp, 0)
+  const normalizedName = normalizeConceptName(name)
+  if (!normalizedName) return false
+  if (SUPPORTING_POINT_NAME_RE.test(name)) return false
+  if (explicitParents.has(normalizedName) && isClearlySupportingName(name)) return false
+
+  const type = firstString(kp.concept_type)
+  const importance = firstString(kp.importance_level).toLowerCase()
+  if (SUPPORTING_POINT_TYPE_RE.test(type) && importance !== "high") return false
+  return true
+}
+
+function isClearlySupportingName(name: string): boolean {
+  return /条件|要求|原则|提示|技巧|步骤|例外|陷阱|处理|案例|例题/.test(name)
+}
+
+function buildExplicitParentLookup(analysis: SubtitleAnalysis): Map<string, string> {
+  const out = new Map<string, string>()
+  const structure = isRecord(analysis.concept_structure) ? analysis.concept_structure : {}
+  const hierarchy = Array.isArray(structure.hierarchy) ? structure.hierarchy : []
+  for (const item of hierarchy) {
+    if (!isRecord(item)) continue
+    const parent = firstString(item.parent, item.name, item.title)
+    if (!parent) continue
+    const children = Array.isArray(item.children) ? item.children : []
+    for (const child of children) {
+      const childName = firstString(child)
+      if (childName) out.set(normalizeConceptName(childName), parent)
+    }
+  }
+
+  for (const kp of analysis.knowledge_points ?? []) {
+    const childName = knowledgePointName(kp, 0)
+    const relationships = Array.isArray(kp.relationships) ? kp.relationships : []
+    for (const rel of relationships) {
+      if (!isRecord(rel)) continue
+      const type = firstString(rel.type).toLowerCase()
+      if (!/broader|parent|上位|属于|part_of/.test(type)) continue
+      const parent = firstString(rel.target, rel.parent, rel.concept)
+      if (parent) out.set(normalizeConceptName(childName), parent)
+    }
+  }
+  return out
+}
+
+function findSupportingPointParent(
+  support: SubtitleKnowledgePoint,
+  index: number,
+  pageNames: string[],
+  pageByName: Map<string, SubtitleKnowledgePoint>,
+  explicitParents: Map<string, string>,
+  allPoints: SubtitleKnowledgePoint[],
+): SubtitleKnowledgePoint | undefined {
+  const name = knowledgePointName(support, index)
+  const explicitParent = explicitParents.get(normalizeConceptName(name))
+  const explicit = explicitParent ? findPageByName(explicitParent, pageByName) : undefined
+  if (explicit) return explicit
+
+  const colonParent = name.split(/[：:]/)[0]?.trim()
+  const colonMatch = colonParent ? findPageByName(colonParent, pageByName) : undefined
+  if (colonMatch) return colonMatch
+
+  const containing = pageNames
+    .filter((pageName) => name.includes(pageName) && pageName !== name)
+    .sort((a, b) => b.length - a.length)[0]
+  const containingMatch = containing ? findPageByName(containing, pageByName) : undefined
+  if (containingMatch) return containingMatch
+
+  const topical = findTopicalParent(name, pageNames, pageByName)
+  if (topical) return topical
+
+  return findNearestPreviousPage(index, pageByName, allPoints)
+}
+
+function findPageByName(name: string, pageByName: Map<string, SubtitleKnowledgePoint>): SubtitleKnowledgePoint | undefined {
+  return pageByName.get(normalizeConceptName(name))
+}
+
+function findTopicalParent(
+  name: string,
+  pageNames: string[],
+  pageByName: Map<string, SubtitleKnowledgePoint>,
+): SubtitleKnowledgePoint | undefined {
+  const groups: Array<{ needle: RegExp; parent: RegExp }> = [
+    { needle: /单位犯罪|单位实施|集体私分|个人为单位|单位消灭|法人资格|单位意志|双罚|单罚/, parent: /单位犯罪/ },
+    { needle: /国家工作人员|村干部/, parent: /国家工作人员/ },
+    { needle: /身份犯|定罪身份|量刑身份|实行犯/, parent: /身份犯/ },
+    { needle: /法益|住宅|脱逃罪|肖申克|人权/, parent: /法益|犯罪客体/ },
+  ]
+  for (const group of groups) {
+    if (!group.needle.test(name)) continue
+    const pageName = pageNames.find((candidate) => group.parent.test(candidate))
+    const page = pageName ? findPageByName(pageName, pageByName) : undefined
+    if (page) return page
+  }
+  return undefined
+}
+
+function findNearestPreviousPage(
+  index: number,
+  pageByName: Map<string, SubtitleKnowledgePoint>,
+  allPoints: SubtitleKnowledgePoint[],
+): SubtitleKnowledgePoint | undefined {
+  for (let i = index - 1; i >= 0; i--) {
+    const page = findPageByName(knowledgePointName(allPoints[i], i), pageByName)
+    if (page) return page
+  }
+  return pageByName.values().next().value
+}
+
+function mergeSupportingPoint(parent: SubtitleKnowledgePoint, support: SubtitleKnowledgePoint, index: number): void {
+  const line = supportingPointLine(support, index)
+  const current = Array.isArray(parent.supporting_points)
+    ? parent.supporting_points.filter((item): item is string => typeof item === "string")
+    : []
+  if (!current.includes(line)) parent.supporting_points = [...current, line]
+
+  const ranges = [...flattenTimeRangeValues(parent.time_range), ...flattenTimeRangeValues(support.time_range)]
+  if (ranges.length > 0) parent.time_range = [...new Set(ranges)]
+}
+
+function supportingPointLine(kp: SubtitleKnowledgePoint, index: number): string {
+  const name = knowledgePointName(kp, index)
+  const range = stringifyTimeRange(kp.time_range)
+  const summary = firstString(kp.core_definition, kp.detailed_content, kp.exam_relevance)
+  return `${range ? `${range} · ` : ""}${name}${summary ? `：${summary}` : ""}`
+}
+
+function normalizeConceptName(value: string): string {
+  return value
+    .replace(/[\s\[\]【】（）()《》「」『』、，,。:：；;]/g, "")
+    .toLowerCase()
 }
 
 function jsonPreview(value: unknown, maxChars: number): string {
