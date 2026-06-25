@@ -31,6 +31,7 @@
 ## Features
 
 - **Two-Step Chain-of-Thought Ingest** — LLM analyzes first, then generates wiki pages with source traceability and incremental cache
+- **Video Subtitle Ingestion** — import `.srt`, `.vtt`, and `.lrc` transcripts, preserve timestamped source context, and turn video subtitles into structured wiki knowledge points
 - **Multimodal Image Ingestion** — extract embedded images from PDFs, generate factual captions with a vision LLM, surface them in image-aware search results with lightbox preview and jump-to-source
 - **Optional MinerU PDF Parsing** — use MinerU cloud parsing for complex PDFs with tables, formulas, and dense layouts; the built-in local parser remains the default
 - **4-Signal Knowledge Graph** — relevance model with direct links, source overlap, Adamic-Adar, and type affinity
@@ -119,6 +120,7 @@ Additional ingest enhancements beyond the original:
 - **SHA256 incremental cache** — source file content is hashed before ingest; unchanged files are skipped automatically, saving LLM tokens and time
 - **Persistent ingest queue** — serial processing prevents concurrent LLM calls; queue persisted to disk, survives app restart; failed tasks auto-retry up to 3 times
 - **Folder import** — recursive folder import preserving directory structure; folder path passed to LLM as classification context (e.g., "papers > energy" helps categorize content)
+- **Video subtitle import** — `.srt`, `.vtt`, and `.lrc` files are recognized as transcript sources; ingest can preserve source/course URL metadata, timestamp anchors, and consolidate subtitle segments into page-worthy concepts plus supporting points
 - **Source folder auto-watch** — files added, edited, or deleted in `raw/sources/` outside the app are picked up automatically and reuse the same ingest/delete lifecycle as in-app actions
 - **Queue visualization** — Activity Panel shows progress bar, pending/processing/failed tasks with cancel and retry buttons
 - **Auto-embedding** — when vector search is enabled, new pages are automatically embedded after ingest
